@@ -261,4 +261,236 @@ async def unban(interaction: discord.Interaction, uzytkownik_id: str, powod: str
         user = await bot.fetch_user(int(uzytkownik_id))
         await interaction.guild.unban(user, reason=f"{interaction.user} | {powod}")
         embed = discord.Embed(title="✅ Odbanowany", color=0x00FF00, timestamp=datetime.utcnow())
-        embed.add_field(name="Użytkownik", value=f"{user} (`
+        embed.add_field(name="Użytkownik", value=f"{user} (`{user.id}`)", inline=False)
+        embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Powód", value=powod, inline=False)
+        await interaction.response.send_message(embed=embed)
+        await send_log(embed)
+    except:
+        await interaction.response.send_message("❌ Nie znaleziono użytkownika lub nie jest zbanowany.\nPodaj **ID** (włącz tryb dewelopera → prawy klik na użytkownika → Kopiuj ID)", ephemeral=True)
+
+@bot.tree.command(name="softban", description="Softban (ban + od razu unban)")
+@app_commands.describe(uzytkownik="Kogo", powod="Powód")
+@is_mod()
+async def softban(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str = "Brak powodu"):
+    if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+        return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
+    await uzytkownik.ban(reason=f"Softban | {interaction.user} | {powod}", delete_message_days=7)
+    await interaction.guild.unban(uzytkownik, reason="Softban")
+    embed = discord.Embed(title="💨 Softban", color=0xFF4500, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Powód", value=powod, inline=False)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+# ====================== KICK / MUTE ======================
+
+@bot.tree.command(name="kick", description="Wyrzuć użytkownika")
+@app_commands.describe(uzytkownik="Kogo", powod="Powód")
+@is_mod()
+async def kick(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str = "Brak powodu"):
+    if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+        return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
+    await uzytkownik.kick(reason=f"{interaction.user} | {powod}")
+    try:
+        await uzytkownik.send(f"**Zostałeś wyrzucony** z serwera **{interaction.guild.name}**\nPowód: {powod}")
+    except:
+        pass
+    embed = discord.Embed(title="👢 Wyrzucony", color=0xFFA500, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Powód", value=powod, inline=False)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+@bot.tree.command(name="mute", description="Wycisz użytkownika (timeout)")
+@app_commands.describe(uzytkownik="Kogo", czas="np. 10m, 1h, 2h 30m, 1d", powod="Powód")
+@is_mod()
+async def mute(interaction: discord.Interaction, uzytkownik: discord.Member, czas: str, powod: str = "Brak powodu"):
+    if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+        return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
+    
+    delta = parse_time(czas)
+    if not delta:
+        return await interaction.response.send_message("❌ Zły format czasu!\nPrzykłady: `10m` `1h` `2h30m` `1d` `1w`", ephemeral=True)
+    if delta.total_seconds() > 28 * 24 * 3600:
+        return await interaction.response.send_message("❌ Maksymalny timeout to 28 dni.", ephemeral=True)
+
+    await uzytkownik.timeout(delta, reason=f"{interaction.user} | {powod}")
+    
+    try:
+        await uzytkownik.send(f"**Zostałeś wyciszony** na serwerze **{interaction.guild.name}**\nPowód: {powod}\nCzas: **{format_time(delta)}**")
+    except:
+        pass
+
+    embed = discord.Embed(title="🔇 Wyciszony", color=0x808080, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Czas", value=format_time(delta), inline=True)
+    embed.add_field(name="Powód", value=powod, inline=False)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+@bot.tree.command(name="unmute", description="Zdejmij wyciszenie")
+@app_commands.describe(uzytkownik="Komu")
+@is_mod()
+async def unmute(interaction: discord.Interaction, uzytkownik: discord.Member):
+    await uzytkownik.timeout(None)
+    embed = discord.Embed(title="🔊 Mute zdjęty", color=0x00FF00, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+# ====================== WARNY ======================
+
+@bot.tree.command(name="warn", description="Ostrzeż użytkownika")
+@app_commands.describe(uzytkownik="Kogo", powod="Powód")
+@is_mod()
+async def warn(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str):
+    async with aiosqlite.connect("moderation.db") as db:
+        await db.execute("INSERT INTO warnings (user_id, moderator_id, reason, timestamp) VALUES (?,?,?,?)",
+                         (uzytkownik.id, interaction.user.id, powod, datetime.utcnow().isoformat()))
+        await db.commit()
+        cur = await db.execute("SELECT COUNT(*) FROM warnings WHERE user_id = ?", (uzytkownik.id,))
+        count = (await cur.fetchone())[0]
+
+    embed = discord.Embed(title="⚠️ Ostrzeżenie", color=0xFFFF00, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Ilość warnów", value=str(count), inline=True)
+    embed.add_field(name="Powód", value=powod, inline=False)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+    try:
+        await uzytkownik.send(f"**Ostrzeżenie** na **{interaction.guild.name}**\nPowód: {powod}\nŁącznie: **{count}**")
+    except:
+        pass
+
+@bot.tree.command(name="warnings", description="Sprawdź ostrzeżenia")
+@app_commands.describe(uzytkownik="Kogo")
+@is_mod()
+async def warnings(interaction: discord.Interaction, uzytkownik: discord.Member):
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute("SELECT reason, timestamp, moderator_id FROM warnings WHERE user_id = ? ORDER BY id DESC", (uzytkownik.id,))
+        rows = await cur.fetchall()
+    if not rows:
+        return await interaction.response.send_message(f"{uzytkownik.mention} nie ma ostrzeżeń.", ephemeral=True)
+    embed = discord.Embed(title=f"Warny — {uzytkownik}", color=0xFFA500, timestamp=datetime.utcnow())
+    for i, (reason, ts, mod) in enumerate(rows[:12], 1):
+        embed.add_field(name=f"#{i} • <t:{int(datetime.fromisoformat(ts).timestamp())}:R>",
+                        value=f"{reason}\nMod: <@{mod}>", inline=False)
+    embed.set_footer(text=f"Łącznie: {len(rows)}")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="clearwarns", description="Wyczyść wszystkie warny")
+@app_commands.describe(uzytkownik="Kogo")
+@is_mod()
+async def clearwarns(interaction: discord.Interaction, uzytkownik: discord.Member):
+    async with aiosqlite.connect("moderation.db") as db:
+        await db.execute("DELETE FROM warnings WHERE user_id = ?", (uzytkownik.id,))
+        await db.commit()
+    embed = discord.Embed(title="🧹 Warny wyczyszczone", color=0x00FF00, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
+    embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+# ====================== RESZTA ======================
+
+@bot.tree.command(name="clear", description="Usuń wiadomości")
+@app_commands.describe(ilosc="1-100")
+@is_mod()
+async def clear(interaction: discord.Interaction, ilosc: app_commands.Range[int, 1, 100]):
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=ilosc)
+    embed = discord.Embed(title="🧹 Usunięto", description=f"**{len(deleted)}** wiadomości", color=0x3498DB)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await send_log(embed)
+
+@bot.tree.command(name="slowmode", description="Ustaw slowmode")
+@app_commands.describe(sekundy="0 = wyłącz")
+@is_mod()
+async def slowmode(interaction: discord.Interaction, sekundy: app_commands.Range[int, 0, 21600]):
+    await interaction.channel.edit(slowmode_delay=sekundy)
+    embed = discord.Embed(title="🐌 Slowmode", description=f"Ustawiono na **{sekundy}s**", color=0x9B59B6)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+@bot.tree.command(name="lock", description="Zablokuj kanał")
+@is_mod()
+async def lock(interaction: discord.Interaction):
+    overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = False
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+    embed = discord.Embed(title="🔒 Kanał zablokowany", color=0xE74C3C)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+@bot.tree.command(name="unlock", description="Odblokuj kanał")
+@is_mod()
+async def unlock(interaction: discord.Interaction):
+    overwrite = interaction.channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = True
+    await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+    embed = discord.Embed(title="🔓 Kanał odblokowany", color=0x2ECC71)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+@bot.tree.command(name="nick", description="Zmień nick")
+@app_commands.describe(uzytkownik="Kogo", nowy_nick="Nowy nick")
+@is_mod()
+async def nick(interaction: discord.Interaction, uzytkownik: discord.Member, nowy_nick: str = None):
+    stary = uzytkownik.display_name
+    await uzytkownik.edit(nick=nowy_nick)
+    embed = discord.Embed(title="📝 Nick zmieniony", color=0x1ABC9C)
+    embed.add_field(name="Użytkownik", value=uzytkownik.mention)
+    embed.add_field(name="Stary", value=stary)
+    embed.add_field(name="Nowy", value=nowy_nick or "zresetowany")
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed)
+
+@bot.tree.command(name="userinfo", description="Info o użytkowniku")
+@app_commands.describe(uzytkownik="Kogo")
+async def userinfo(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
+    user = uzytkownik or interaction.user
+    embed = discord.Embed(title=f"Informacje — {user}", color=user.color or 0x5865F2, timestamp=datetime.utcnow())
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="ID", value=user.id, inline=True)
+    embed.add_field(name="Nick", value=user.display_name, inline=True)
+    embed.add_field(name="Konto utworzone", value=f"<t:{int(user.created_at.timestamp())}:R>", inline=False)
+    embed.add_field(name="Dołączył", value=f"<t:{int(user.joined_at.timestamp())}:R>" if user.joined_at else "?", inline=False)
+    roles = [r.mention for r in user.roles if r != interaction.guild.default_role]
+    embed.add_field(name=f"Role ({len(roles)})", value=" ".join(roles[:12]) or "Brak", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="serverinfo", description="Info o serwerze")
+async def serverinfo(interaction: discord.Interaction):
+    g = interaction.guild
+    embed = discord.Embed(title=g.name, color=0x5865F2, timestamp=datetime.utcnow())
+    if g.icon:
+        embed.set_thumbnail(url=g.icon.url)
+    embed.add_field(name="Właściciel", value=g.owner.mention if g.owner else "?", inline=True)
+    embed.add_field(name="Członkowie", value=g.member_count, inline=True)
+    embed.add_field(name="Kanały", value=len(g.channels), inline=True)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="invites", description="Kto kogo zaprosił")
+@app_commands.describe(uzytkownik="Opcjonalnie")
+async def invites(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
+    target = uzytkownik or interaction.user
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute("SELECT invited_id, code, timestamp FROM invites WHERE inviter_id = ? ORDER BY timestamp DESC", (target.id,))
+        rows = await cur.fetchall()
+    embed = discord.Embed(title=f"📨 Zaproszenia — {target}", color=0x5865F2, timestamp=datetime.utcnow())
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="Łącznie", value=str(len(rows)), inline=False)
+    if rows:
+        tekst = "\n".join([f"• <@{i}> (`{i}`) — `{c}` • <t:{int(datetime.fromisoformat(t).timestamp())}:R>" for i, c, t in rows[:12]])
+        embed.add_field(name="Ostatnie", value=tekst, inline=False)
+    else:
+        embed.add_field(name="Ostatnie", value="Brak danych", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+bot.run(TOKEN)
