@@ -1,4 +1,0 @@
-discord.py
-aiosqlite
-Pillow
-aiohttp
