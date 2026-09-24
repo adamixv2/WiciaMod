@@ -110,17 +110,19 @@ def is_mod():
     return app_commands.check(predicate)
 
 
-async def send_log(embed: discord.Embed):
-    if LOG_CHANNEL_ID:
-        ch = bot.get_channel(LOG_CHANNEL_ID)
-        if ch:
-            await ch.send(embed=embed)
+async def send_log(embed: discord.Embed, *, skip_channel_id: int = None):
+    if not LOG_CHANNEL_ID:
+        return
+    if skip_channel_id and skip_channel_id == LOG_CHANNEL_ID:
+        return
+    ch = bot.get_channel(LOG_CHANNEL_ID)
+    if ch:
+        await ch.send(embed=embed)
 
 
 async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", duration=None, extra=None):
     reason = (reason or "Brak powodu").strip() or "Brak powodu"
     server = SERVER_NAME
-
     lines = {
         "muted": (
             f"Zostałeś wyciszony na serwerze **{server}** na **{duration}**. | {reason}"
@@ -136,7 +138,6 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
         "warned": f"Otrzymałeś ostrzeżenie na serwerze **{server}**. | {reason}",
         "softbanned": f"Zostałeś wyrzucony z serwera **{server}**. | {reason}",
     }
-
     titles = {
         "muted": "🔇 Zostałeś wyciszony",
         "unmuted": "🔊 Wyciszenie zdjęte",
@@ -146,17 +147,14 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
         "warned": "⚠️ Otrzymałeś ostrzeżenie",
         "softbanned": "💨 Zostałeś wyrzucony",
     }
-
     line = lines.get(action, f"Powiadomienie z serwera **{server}**. | {reason}")
     plain = line.replace("**", "")
-
     embed = discord.Embed(title=titles.get(action, "Powiadomienie"), description=line, color=color, timestamp=datetime.utcnow())
     icon = guild.icon.url if guild and guild.icon else None
     if icon:
         embed.set_author(name=server, icon_url=icon)
     else:
         embed.set_author(name=server)
-
     embed.add_field(name="Serwer", value=server, inline=True)
     if duration:
         embed.add_field(name="Czas", value=duration, inline=True)
@@ -165,7 +163,6 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
     if extra:
         embed.add_field(name="Info", value=extra, inline=False)
     embed.set_footer(text="Jeśli uważasz, że to pomyłka — napisz do administracji serwera.")
-
     try:
         await user.send(content=plain, embed=embed)
         return True
@@ -185,25 +182,20 @@ async def create_welcome_card(member: discord.Member) -> discord.File:
     async with aiohttp.ClientSession() as session:
         async with session.get(str(member.display_avatar.replace(size=128))) as resp:
             avatar_data = await resp.read()
-
     avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((120, 120))
     card = Image.new("RGBA", (500, 180), (25, 25, 30, 255))
     draw = ImageDraw.Draw(card)
-
     mask = Image.new("L", (120, 120), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, 120, 120), fill=255)
     card.paste(avatar, (30, 30), mask)
-
     try:
         font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
     except Exception:
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
-
     draw.text((170, 40), "Siema", font=font_big, fill=(255, 255, 255))
     draw.text((170, 100), str(member.display_name), font=font_small, fill=(160, 160, 255))
-
     buffer = io.BytesIO()
     card.save(buffer, format="PNG")
     buffer.seek(0)
@@ -248,7 +240,6 @@ async def on_member_join(member: discord.Member):
         await update_invite_cache(guild)
     except Exception:
         pass
-
     if WELCOME_CHANNEL_ID:
         channel = bot.get_channel(WELCOME_CHANNEL_ID)
         if channel:
@@ -258,7 +249,6 @@ async def on_member_join(member: discord.Member):
                 await channel.send(f"Witamy {member.mention} na **{SERVER_NAME}**")
             except Exception as e:
                 print(f"Błąd powitania: {e}")
-
     if VERIFIED_ROLE_ID:
         role = member.guild.get_role(VERIFIED_ROLE_ID)
         if role:
@@ -283,51 +273,31 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if interaction.response.is_done():
         return
     if isinstance(error, app_commands.TransformerError):
-        await interaction.response.send_message(
-            "❌ **Nie znaleziono użytkownika.**\nUżyj **@wzmianki** albo podaj **ID**.",
-            ephemeral=True,
-        )
+        await interaction.response.send_message("❌ **Nie znaleziono użytkownika.**\nUżyj **@wzmianki** albo podaj **ID**.", ephemeral=True)
         return
     await interaction.response.send_message(f"❌ Wystąpił błąd: `{str(error)[:200]}`", ephemeral=True)
     print(f"[ERROR] {error}")
 
 
 @bot.tree.command(name="ban", description="Zbanuj użytkownika (można z czasem)")
-@app_commands.describe(
-    uzytkownik="Kogo zbanować (@mention lub ID)",
-    powod="Powód (dokładnie to poleci na PV)",
-    czas="Opcjonalnie: 10m, 1h, 2h 30m, 1d, 1w (puste = permanentny)",
-)
+@app_commands.describe(uzytkownik="Kogo zbanować (@mention lub ID)", powod="Powód (dokładnie to poleci na PV)", czas="Opcjonalnie: 10m, 1h, 1d, 1w (puste = permanentny)")
 @is_mod()
 async def ban(interaction: discord.Interaction, uzytkownik: discord.User, powod: str = "Brak powodu", czas: str = None):
     member = interaction.guild.get_member(uzytkownik.id)
     if member is not None:
         if member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
             return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
-
     delta = parse_time(czas) if czas else None
     duration_human = format_time_human(delta) if delta else None
-
-    await notify_user(
-        uzytkownik, interaction.guild, action="banned", color=0xFF0000,
-        reason=powod, duration=duration_human,
-        extra="Ban jest permanentny." if not delta else None,
-    )
-
-    await interaction.guild.ban(
-        uzytkownik,
-        reason=f"{interaction.user} | {powod}" + (f" | {czas}" if czas else ""),
-        delete_message_days=1,
-    )
-
+    await notify_user(uzytkownik, interaction.guild, action="banned", color=0xFF0000, reason=powod, duration=duration_human, extra="Ban jest permanentny." if not delta else None)
+    await interaction.guild.ban(uzytkownik, reason=f"{interaction.user} | {powod}" + (f" | {czas}" if czas else ""), delete_message_days=1)
     embed = discord.Embed(title="🔨 Zbanowany", color=0xFF0000, timestamp=datetime.utcnow())
     embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
     embed.add_field(name="Czas", value=format_time(delta) if delta else "Permanentny", inline=True)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
-
+    await send_log(embed, skip_channel_id=interaction.channel_id)
     if delta:
         async def unban_later():
             await asyncio.sleep(delta.total_seconds())
@@ -353,7 +323,7 @@ async def unban(interaction: discord.Interaction, uzytkownik_id: str, powod: str
         embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
         embed.add_field(name="Powód", value=powod, inline=False)
         await interaction.response.send_message(embed=embed)
-        await send_log(embed)
+        await send_log(embed, skip_channel_id=interaction.channel_id)
     except Exception:
         await interaction.response.send_message("❌ Nie znaleziono użytkownika lub nie jest zbanowany.\nPodaj **ID**.", ephemeral=True)
 
@@ -372,7 +342,7 @@ async def softban(interaction: discord.Interaction, uzytkownik: discord.Member, 
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="kick", description="Wyrzuć użytkownika")
@@ -388,7 +358,7 @@ async def kick(interaction: discord.Interaction, uzytkownik: discord.Member, pow
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="mute", description="Wycisz użytkownika (timeout)")
@@ -410,7 +380,7 @@ async def mute(interaction: discord.Interaction, uzytkownik: discord.Member, cza
     embed.add_field(name="Czas", value=format_time(delta), inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="unmute", description="Zdejmij wyciszenie")
@@ -423,7 +393,7 @@ async def unmute(interaction: discord.Interaction, uzytkownik: discord.Member):
     embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="warn", description="Ostrzeż użytkownika")
@@ -442,7 +412,7 @@ async def warn(interaction: discord.Interaction, uzytkownik: discord.Member, pow
     embed.add_field(name="Ilość warnów", value=str(count), inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
     await notify_user(uzytkownik, interaction.guild, action="warned", color=0xFFFF00, reason=powod, extra=f"Łączna liczba ostrzeżeń: **{count}**")
 
 
@@ -473,7 +443,7 @@ async def clearwarns(interaction: discord.Interaction, uzytkownik: discord.Membe
     embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="clear", description="Usuń wiadomości")
@@ -494,7 +464,7 @@ async def slowmode(interaction: discord.Interaction, sekundy: app_commands.Range
     await interaction.channel.edit(slowmode_delay=sekundy)
     embed = discord.Embed(title="🐌 Slowmode", description=f"Ustawiono na **{sekundy}s**", color=0x9B59B6)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="lock", description="Zablokuj kanał")
@@ -505,7 +475,7 @@ async def lock(interaction: discord.Interaction):
     await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
     embed = discord.Embed(title="🔒 Kanał zablokowany", color=0xE74C3C)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="unlock", description="Odblokuj kanał")
@@ -516,7 +486,7 @@ async def unlock(interaction: discord.Interaction):
     await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
     embed = discord.Embed(title="🔓 Kanał odblokowany", color=0x2ECC71)
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="nick", description="Zmień nick")
@@ -530,7 +500,7 @@ async def nick(interaction: discord.Interaction, uzytkownik: discord.Member, now
     embed.add_field(name="Stary", value=stary)
     embed.add_field(name="Nowy", value=nowy_nick or "zresetowany")
     await interaction.response.send_message(embed=embed)
-    await send_log(embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="userinfo", description="Info o użytkowniku")
