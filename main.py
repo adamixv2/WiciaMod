@@ -202,55 +202,67 @@ async def create_welcome_card(member: discord.Member) -> discord.File:
         async with session.get(str(member.display_avatar.replace(size=256))) as resp:
             avatar_data = await resp.read()
 
-    W, H = 950, 300
-    card = Image.new("RGBA", (W, H), (12, 12, 16, 255))
+    # Kompaktowa karta – tekst zajmuje większość boxa (nie wygląda na mały)
+    W, H = 720, 200
+    card = Image.new("RGBA", (W, H), (16, 16, 20, 255))
     draw = ImageDraw.Draw(card)
 
-    # Tło – ciemne z geometrycznymi kształtami (styl ProBot)
+    # Tło jak u ProBota – ciemne + geometryczne kształty
     for y in range(H):
-        shade = 12 + int(10 * (y / H))
-        draw.line([(0, y), (W, y)], fill=(shade, shade, shade + 6, 255))
+        shade = 16 + int(12 * (y / max(H, 1)))
+        draw.line([(0, y), (W, y)], fill=(shade, shade, shade + 5, 255))
 
-    # Duże trójkąty / kształty w tle (jak u ProBota)
-    shapes = [
-        [(550, -30), (900, 80), (700, 200)],
-        [(400, 180), (750, 100), (850, 300)],
-        [(-50, 50), (200, -20), (150, 250)],
-        [(200, 200), (450, 150), (500, 320)],
+    # Trójkąty / kształty w tle
+    polys = [
+        [(480, -40), (720, 40), (620, 180)],
+        [(350, 160), (650, 90), (720, 220)],
+        [(-30, 30), (180, -50), (120, 220)],
+        [(200, 170), (420, 120), (480, 240)],
+        [(500, 50), (700, -20), (750, 150)],
     ]
-    for pts in shapes:
-        draw.polygon(pts, fill=(28, 28, 38, 90))
+    for pts in polys:
+        draw.polygon(pts, fill=(32, 32, 42, 110))
 
     # Avatar – zaokrąglony kwadrat
-    avatar_size = 160
+    avatar_size = 130
     avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((avatar_size, avatar_size))
     mask = Image.new("L", (avatar_size, avatar_size), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, avatar_size - 1, avatar_size - 1], radius=22, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, avatar_size - 1, avatar_size - 1], radius=20, fill=255)
 
-    # Cień
-    shadow = Image.new("RGBA", (avatar_size + 12, avatar_size + 12), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle([6, 6, avatar_size + 5, avatar_size + 5], radius=22, fill=(0, 0, 0, 120))
-    ax, ay = 40, (H - avatar_size) // 2
-    card.paste(shadow, (ax - 2, ay + 4), shadow)
+    ax, ay = 28, (H - avatar_size) // 2
+    # lekki cień
+    shadow = Image.new("RGBA", (avatar_size + 10, avatar_size + 10), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle([4, 4, avatar_size + 3, avatar_size + 3], radius=20, fill=(0, 0, 0, 110))
+    card.paste(shadow, (ax - 2, ay + 3), shadow)
     card.paste(avatar, (ax, ay), mask)
 
-    # Box tekstowy
-    bx1, by1 = 240, 45
-    bx2, by2 = W - 40, H - 45
-    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=18, fill=(28, 28, 36, 235))
-    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=18, outline=(60, 60, 75, 200), width=2)
+    # Box tekstowy – ciasny, mało pustej przestrzeni
+    bx1, by1 = 185, 30
+    bx2, by2 = W - 28, H - 30
+    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=16, fill=(26, 26, 34, 240))
+    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=16, outline=(55, 55, 70, 220), width=2)
 
-    # DUŻE fonty
+    # Fonty – BARDZO duże względem karty
     try:
-        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
-        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
+        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
+        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
     except Exception:
         font_name = ImageFont.load_default()
         font_sub = ImageFont.load_default()
 
-    name = str(member.display_name)[:18]
-    draw.text((bx1 + 36, by1 + 28), name, font=font_name, fill=(255, 255, 255, 255))
-    draw.text((bx1 + 36, by1 + 120), "Witaj na serwerze!", font=font_sub, fill=(150, 165, 255, 255))
+    name = str(member.display_name)[:16]
+
+    # Wyśrodkowanie w pionie w boxie
+    name_bbox = draw.textbbox((0, 0), name, font=font_name)
+    sub_bbox = draw.textbbox((0, 0), "Witaj na serwerze!", font=font_sub)
+    name_h = name_bbox[3] - name_bbox[1]
+    sub_h = sub_bbox[3] - sub_bbox[1]
+    gap = 12
+    total_h = name_h + gap + sub_h
+    start_y = by1 + (by2 - by1 - total_h) // 2
+
+    draw.text((bx1 + 28, start_y), name, font=font_name, fill=(255, 255, 255, 255))
+    draw.text((bx1 + 28, start_y + name_h + gap), "Witaj na serwerze!", font=font_sub, fill=(145, 160, 255, 255))
 
     buffer = io.BytesIO()
     card.save(buffer, format="PNG")
