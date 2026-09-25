@@ -201,76 +201,74 @@ async def create_welcome_card(member: discord.Member) -> discord.File:
         async with session.get(str(member.display_avatar.replace(size=256))) as resp:
             avatar_data = await resp.read()
 
-    # Wymiary karty (styl ProBot)
-    W, H = 700, 220
-    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    # Wymiary – podobne do ProBota
+    W, H = 800, 250
+    card = Image.new("RGBA", (W, H), (18, 18, 22, 255))
     draw = ImageDraw.Draw(card)
 
-    # Tło – ciemny gradient / solid
-    bg_color = (22, 22, 28, 255)
-    draw.rounded_rectangle([(0, 0), (W - 1, H - 1)], radius=20, fill=bg_color)
+    # Tło – ciemne z subtelnym gradientem (styl ProBot)
+    for y in range(H):
+        # lekki gradient od góry do dołu
+        shade = 18 + int(8 * (y / H))
+        draw.line([(0, y), (W, y)], fill=(shade, shade, shade + 4, 255))
 
-    # Subtelna ramka
-    draw.rounded_rectangle([(0, 0), (W - 1, H - 1)], radius=20, outline=(55, 55, 70, 255), width=2)
+    # Dekoracyjne ciemniejsze „panele” w tle (jak blur u ProBota)
+    for i in range(4):
+        x = 80 + i * 180
+        draw.ellipse([x - 60, -40, x + 120, 160], fill=(28, 28, 35, 80))
+        draw.ellipse([x + 40, 100, x + 200, H + 40], fill=(25, 25, 32, 60))
 
-    # Panel tekstowy (jak u ProBota – ciemniejszy box)
-    panel_x1, panel_y1 = 200, 40
-    panel_x2, panel_y2 = W - 40, H - 40
-    draw.rounded_rectangle(
-        [(panel_x1, panel_y1), (panel_x2, panel_y2)],
-        radius=16,
-        fill=(32, 32, 40, 240),
+    # Avatar – kwadratowy z lekkim zaokrągleniem (jak ProBot)
+    avatar_size = 130
+    avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((avatar_size, avatar_size))
+
+    # Zaokrąglona maska (lekko, nie pełny okrąg)
+    mask = Image.new("L", (avatar_size, avatar_size), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle([0, 0, avatar_size - 1, avatar_size - 1], radius=18, fill=255)
+
+    # Cień pod avatar
+    shadow = Image.new("RGBA", (avatar_size + 8, avatar_size + 8), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        [4, 4, avatar_size + 3, avatar_size + 3], radius=18, fill=(0, 0, 0, 100)
     )
+    card.paste(shadow, (38, (H - avatar_size) // 2 + 4), shadow)
+
+    avatar_x = 40
+    avatar_y = (H - avatar_size) // 2
+    card.paste(avatar, (avatar_x, avatar_y), mask)
+
+    # Ciemny box z tekstem (jak u ProBota)
+    box_x1 = 200
+    box_y1 = 55
+    box_x2 = W - 45
+    box_y2 = H - 55
     draw.rounded_rectangle(
-        [(panel_x1, panel_y1), (panel_x2, panel_y2)],
-        radius=16,
-        outline=(70, 70, 90, 180),
+        [box_x1, box_y1, box_x2, box_y2],
+        radius=14,
+        fill=(30, 30, 36, 230),
+    )
+    # cienka ramka
+    draw.rounded_rectangle(
+        [box_x1, box_y1, box_x2, box_y2],
+        radius=14,
+        outline=(55, 55, 65, 200),
         width=1,
     )
 
-    # Avatar – okrągły z obramowaniem
-    avatar_size = 140
-    avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((avatar_size, avatar_size))
-    mask = Image.new("L", (avatar_size, avatar_size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
-
-    # Obramowanie avatara (akcent)
-    ring = Image.new("RGBA", (avatar_size + 10, avatar_size + 10), (0, 0, 0, 0))
-    ring_draw = ImageDraw.Draw(ring)
-    ring_draw.ellipse((0, 0, avatar_size + 9, avatar_size + 9), fill=(88, 101, 242, 255))  # Discord blurple
-    ring_draw.ellipse((4, 4, avatar_size + 5, avatar_size + 5), fill=(22, 22, 28, 255))
-    card.paste(ring, (25, (H - avatar_size - 10) // 2), ring)
-
-    avatar_pos = (30, (H - avatar_size) // 2)
-    card.paste(avatar, avatar_pos, mask)
-
-    # Fonty
+    # Fonty – większe i pogrubione
     try:
-        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-        font_welcome = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
+        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
     except Exception:
         font_name = ImageFont.load_default()
-        font_welcome = ImageFont.load_default()
-        font_small = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
 
-    # Teksty (polski, pogrubione)
-    name = str(member.display_name)[:22]
-    # Nazwa użytkownika
-    draw.text((panel_x1 + 28, panel_y1 + 28), name, font=font_name, fill=(255, 255, 255, 255))
-    # Witaj na serwerze
-    draw.text((panel_x1 + 28, panel_y1 + 80), "Witaj na serwerze!", font=font_welcome, fill=(160, 170, 255, 255))
-    # Liczba członków (opcjonalnie)
-    try:
-        member_count = member.guild.member_count if member.guild else 0
-        draw.text(
-            (panel_x1 + 28, panel_y1 + 120),
-            f"Jesteś #{member_count} członkiem",
-            font=font_small,
-            fill=(140, 140, 160, 255),
-        )
-    except Exception:
-        pass
+    name = str(member.display_name)[:20]
+    # Nazwa – duża, biała, pogrubiona
+    draw.text((box_x1 + 30, box_y1 + 28), name, font=font_name, fill=(255, 255, 255, 255))
+    # Podpis – jasnoniebieski, pogrubiony
+    draw.text((box_x1 + 30, box_y1 + 90), "Witaj na serwerze!", font=font_sub, fill=(140, 155, 255, 255))
 
     buffer = io.BytesIO()
     card.save(buffer, format="PNG")
@@ -378,7 +376,8 @@ async def on_member_join(member: discord.Member):
         if channel:
             try:
                 file = await create_welcome_card(member)
-                await channel.send(content=f"👋 {member.mention}", file=file)
+                await channel.send(file=file)
+                await channel.send(f"Siema {member.mention} na **{SERVER_NAME}**")
             except Exception as e:
                 print(f"Błąd powitania: {e}")
     if VERIFIED_ROLE_ID:
