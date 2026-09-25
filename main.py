@@ -155,6 +155,7 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
         "banned": f"Zostałeś zbanowany na serwerze **{server}**" + (f" na **{duration}**" if duration else "") + f". | {reason}",
         "unbanned": f"Zostałeś odbanowany na serwerze **{server}**. | {reason}",
         "kicked": f"Zostałeś wyrzucony z serwera **{server}**. | {reason}",
+        "softbanned": f"Zostałeś softbanowany na serwerze **{server}**. | {reason}",
         "warned": f"Otrzymałeś ostrzeżenie na serwerze **{server}**. | {reason}",
     }
     titles = {
@@ -163,6 +164,7 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
         "banned": "🔨 Zostałeś zbanowany",
         "unbanned": "✅ Zostałeś odbanowany",
         "kicked": "👢 Zostałeś wyrzucony",
+        "softbanned": "💨 Softban",
         "warned": "⚠️ Otrzymałeś ostrzeżenie",
     }
     line = lines.get(action, f"Powiadomienie z serwera **{server}**. | {reason}")
@@ -196,79 +198,69 @@ async def update_invite_cache(guild):
 
 
 async def create_welcome_card(member: discord.Member) -> discord.File:
-    # Pobierz avatar
     async with aiohttp.ClientSession() as session:
         async with session.get(str(member.display_avatar.replace(size=256))) as resp:
             avatar_data = await resp.read()
 
-    # Wymiary – podobne do ProBota
-    W, H = 800, 250
-    card = Image.new("RGBA", (W, H), (18, 18, 22, 255))
+    W, H = 720, 200
+    card = Image.new("RGBA", (W, H), (16, 16, 20, 255))
     draw = ImageDraw.Draw(card)
 
-    # Tło – ciemne z subtelnym gradientem (styl ProBot)
+    # Tło w stylu ProBot – ciemne + geometryczne kształty
+    # bazowy gradient
     for y in range(H):
-        # lekki gradient od góry do dołu
-        shade = 18 + int(8 * (y / H))
-        draw.line([(0, y), (W, y)], fill=(shade, shade, shade + 4, 255))
+        c = 16 + int(6 * (y / H))
+        draw.line([(0, y), (W, y)], fill=(c, c, c + 3, 255))
 
-    # Dekoracyjne ciemniejsze „panele” w tle (jak blur u ProBota)
-    for i in range(4):
-        x = 80 + i * 180
-        draw.ellipse([x - 60, -40, x + 120, 160], fill=(28, 28, 35, 80))
-        draw.ellipse([x + 40, 100, x + 200, H + 40], fill=(25, 25, 32, 60))
+    # duże rozmyte trójkąty / bloby (jak tło ProBota)
+    shapes = [
+        # lewy górny
+        [(0, 0), (180, 0), (90, 140)],
+        # prawy górny
+        [(W - 220, 0), (W, 0), (W, 160), (W - 100, 80)],
+        # dolny środek
+        [(200, H), (420, H), (350, 80)],
+        # prawy dół
+        [(W - 180, H), (W, H), (W, 100)],
+    ]
+    for pts in shapes:
+        draw.polygon(pts, fill=(28, 28, 36, 90))
 
-    # Avatar – kwadratowy z lekkim zaokrągleniem (jak ProBot)
-    avatar_size = 130
+    # dodatkowe elipsy
+    draw.ellipse([-40, -60, 160, 140], fill=(35, 35, 48, 70))
+    draw.ellipse([W - 200, 40, W + 40, H + 40], fill=(32, 32, 42, 80))
+    draw.ellipse([300, -50, 520, 100], fill=(25, 25, 35, 60))
+
+    # Avatar – zaokrąglony kwadrat
+    avatar_size = 120
     avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((avatar_size, avatar_size))
-
-    # Zaokrąglona maska (lekko, nie pełny okrąg)
     mask = Image.new("L", (avatar_size, avatar_size), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.rounded_rectangle([0, 0, avatar_size - 1, avatar_size - 1], radius=18, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, avatar_size - 1, avatar_size - 1], radius=16, fill=255)
 
-    # Cień pod avatar
-    shadow = Image.new("RGBA", (avatar_size + 8, avatar_size + 8), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle(
-        [4, 4, avatar_size + 3, avatar_size + 3], radius=18, fill=(0, 0, 0, 100)
-    )
-    card.paste(shadow, (38, (H - avatar_size) // 2 + 4), shadow)
+    # cień
+    shadow = Image.new("RGBA", (avatar_size + 6, avatar_size + 6), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle([3, 3, avatar_size + 2, avatar_size + 2], radius=16, fill=(0, 0, 0, 120))
+    ax, ay = 28, (H - avatar_size) // 2
+    card.paste(shadow, (ax + 2, ay + 3), shadow)
+    card.paste(avatar, (ax, ay), mask)
 
-    avatar_x = 40
-    avatar_y = (H - avatar_size) // 2
-    card.paste(avatar, (avatar_x, avatar_y), mask)
+    # Ciemny box tekstowy
+    bx1, by1 = 175, 35
+    bx2, by2 = W - 30, H - 35
+    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=12, fill=(26, 26, 32, 235))
+    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=12, outline=(50, 50, 60, 180), width=1)
 
-    # Ciemny box z tekstem (jak u ProBota)
-    box_x1 = 200
-    box_y1 = 55
-    box_x2 = W - 45
-    box_y2 = H - 55
-    draw.rounded_rectangle(
-        [box_x1, box_y1, box_x2, box_y2],
-        radius=14,
-        fill=(30, 30, 36, 230),
-    )
-    # cienka ramka
-    draw.rounded_rectangle(
-        [box_x1, box_y1, box_x2, box_y2],
-        radius=14,
-        outline=(55, 55, 65, 200),
-        width=1,
-    )
-
-    # Fonty – większe i pogrubione
+    # Fonty – DUŻE i pogrubione
     try:
-        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
-        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 44)
+        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
     except Exception:
         font_name = ImageFont.load_default()
         font_sub = ImageFont.load_default()
 
-    name = str(member.display_name)[:20]
-    # Nazwa – duża, biała, pogrubiona
-    draw.text((box_x1 + 30, box_y1 + 28), name, font=font_name, fill=(255, 255, 255, 255))
-    # Podpis – jasnoniebieski, pogrubiony
-    draw.text((box_x1 + 30, box_y1 + 90), "Witaj na serwerze!", font=font_sub, fill=(140, 155, 255, 255))
+    name = str(member.display_name)[:18]
+    draw.text((bx1 + 24, by1 + 22), name, font=font_name, fill=(255, 255, 255, 255))
+    draw.text((bx1 + 24, by1 + 80), "Witaj na serwerze!", font=font_sub, fill=(150, 160, 255, 255))
 
     buffer = io.BytesIO()
     card.save(buffer, format="PNG")
@@ -528,7 +520,7 @@ async def cmd_unban(interaction: discord.Interaction, uzytkownik_id: str, powod:
 async def cmd_softban(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str = "Brak powodu"):
     if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
         return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
-    await notify_user(uzytkownik, interaction.guild, action="kicked", color=0xFF4500, reason=powod, extra="Wiadomości z 7 dni usunięte.")
+    await notify_user(uzytkownik, interaction.guild, action="softbanned", color=0xFF4500, reason=powod, extra="Wiadomości z 7 dni usunięte.")
     await uzytkownik.ban(reason=f"Softban | {interaction.user} | {powod}", delete_message_days=7)
     await interaction.guild.unban(uzytkownik, reason="Softban")
     embed = discord.Embed(title="💨 Softban", color=0xFF4500, timestamp=datetime.utcnow())
