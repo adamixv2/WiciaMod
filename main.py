@@ -7,6 +7,7 @@ import re
 import aiohttp
 import io
 import asyncio
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
@@ -18,16 +19,26 @@ WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
 GOODBYE_CHANNEL_ID = int(os.getenv("GOODBYE_CHANNEL_ID", "0"))
 VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0"))
 
+# === TEMP VC (ustaw ID hubu i kategorii albo zostaw 0) ===
+TEMP_HUB_CHANNEL_ID = int(os.getenv("TEMP_HUB_CHANNEL_ID", "0"))
+TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0"))
+TEMP_ENABLED = True
+TEMP_MAX_CHANNELS = 3
+TEMP_DELETE_SECONDS = 30
+
 SERVER_NAME = "WiciaClient20PLN"
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.invites = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 invite_cache = {}
+temp_channels = {}  # channel_id -> owner_id
 
+# ===================== HELPERY =====================
 
 def parse_time(time_str: str) -> Optional[timedelta]:
     if not time_str:
@@ -53,7 +64,6 @@ def parse_time(time_str: str) -> Optional[timedelta]:
             total += timedelta(days=value * 30)
     return total if total.total_seconds() > 0 else None
 
-
 def format_time(td: timedelta) -> str:
     seconds = int(td.total_seconds())
     if seconds < 60:
@@ -66,7 +76,6 @@ def format_time(td: timedelta) -> str:
         return f"{seconds // 86400}d"
     return f"{seconds // 604800}w"
 
-
 def _plural(n: int, forms: tuple) -> str:
     n = abs(n)
     if n == 1:
@@ -74,7 +83,6 @@ def _plural(n: int, forms: tuple) -> str:
     if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
         return f"{n} {forms[1]}"
     return f"{n} {forms[2]}"
-
 
 def format_time_human(td: timedelta) -> str:
     seconds = int(td.total_seconds())
@@ -88,7 +96,6 @@ def format_time_human(td: timedelta) -> str:
         return _plural(seconds // 86400, ("dzień", "dni", "dni"))
     return _plural(seconds // 604800, ("tydzień", "tygodnie", "tygodni"))
 
-
 async def init_db():
     async with aiosqlite.connect("moderation.db") as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS warnings (
@@ -96,8 +103,15 @@ async def init_db():
             user_id INTEGER, moderator_id INTEGER, reason TEXT, timestamp TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS invites (
             inviter_id INTEGER, invited_id INTEGER, code TEXT, timestamp TEXT)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS economy (
+            user_id INTEGER PRIMARY KEY, credits INTEGER DEFAULT 0,
+            last_daily TEXT, rep INTEGER DEFAULT 0, last_rep TEXT,
+            title TEXT DEFAULT '', text_xp INTEGER DEFAULT 0, voice_xp INTEGER DEFAULT 0)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS points (
+            user_id INTEGER PRIMARY KEY, points INTEGER DEFAULT 0)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS muted_text (
+            user_id INTEGER PRIMARY KEY, until TEXT)""")
         await db.commit()
-
 
 def is_mod():
     async def predicate(interaction: discord.Interaction):
@@ -109,7 +123,6 @@ def is_mod():
         return False
     return app_commands.check(predicate)
 
-
 async def send_log(embed: discord.Embed, *, skip_channel_id: int = None):
     if not LOG_CHANNEL_ID:
         return
@@ -118,7 +131,6 @@ async def send_log(embed: discord.Embed, *, skip_channel_id: int = None):
     ch = bot.get_channel(LOG_CHANNEL_ID)
     if ch:
         await ch.send(embed=embed)
-
 
 async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", duration=None, extra=None):
     reason = (reason or "Brak powodu").strip() or "Brak powodu"
@@ -169,14 +181,12 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
     except Exception:
         return False
 
-
 async def update_invite_cache(guild):
     try:
         invites = await guild.invites()
         invite_cache[guild.id] = {i.code: i.uses for i in invites}
     except Exception:
         invite_cache[guild.id] = {}
-
 
 async def create_welcome_card(member: discord.Member) -> discord.File:
     async with aiohttp.ClientSession() as session:
@@ -195,12 +205,51 @@ async def create_welcome_card(member: discord.Member) -> discord.File:
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
     draw.text((170, 40), "Siema", font=font_big, fill=(255, 255, 255))
-    draw.text((170, 100), str(member.display_name), font=font_small, fill=(160, 160, 255))
+    draw.text((170, 100), str(member.display_name)[:20], font=font_small, fill=(160, 160, 255))
     buffer = io.BytesIO()
     card.save(buffer, format="PNG")
     buffer.seek(0)
     return discord.File(buffer, filename="welcome.png")
 
+async def get_economy(user_id: int):
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute("SELECT credits, last_daily, rep, last_rep, title, text_xp, voice_xp FROM economy WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT INTO economy (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+            return 0, None, 0, None, "", 0, 0
+        return row
+
+async def set_economy(user_id: int, **kwargs):
+    async with aiosqlite.connect("moderation.db") as db:
+        await db.execute("INSERT OR IGNORE INTO economy (user_id) VALUES (?)", (user_id,))
+        for k, v in kwargs.items():
+            await db.execute(f"UPDATE economy SET {k} = ? WHERE user_id = ?", (v, user_id))
+        await db.commit()
+
+async def get_points(user_id: int) -> int:
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute("INSERT INTO points (user_id, points) VALUES (?, 0)", (user_id,))
+            await db.commit()
+            return 0
+        return row[0]
+
+async def set_points(user_id: int, amount: int):
+    async with aiosqlite.connect("moderation.db") as db:
+        await db.execute("INSERT OR REPLACE INTO points (user_id, points) VALUES (?, ?)", (user_id, max(0, amount)))
+        await db.commit()
+
+def xp_to_level(xp: int) -> int:
+    return int((xp / 100) ** 0.5) + 1
+
+def level_to_xp(level: int) -> int:
+    return (level - 1) ** 2 * 100
+
+# ===================== EVENTS =====================
 
 @bot.event
 async def on_ready():
@@ -210,16 +259,13 @@ async def on_ready():
     synced = await bot.tree.sync()
     print(f"Zalogowano: {bot.user} | Komend: {len(synced)}")
 
-
 @bot.event
 async def on_invite_create(invite):
     await update_invite_cache(invite.guild)
 
-
 @bot.event
 async def on_invite_delete(invite):
     await update_invite_cache(invite.guild)
-
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -257,7 +303,6 @@ async def on_member_join(member: discord.Member):
             except Exception:
                 pass
 
-
 @bot.event
 async def on_member_remove(member: discord.Member):
     if GOODBYE_CHANNEL_ID:
@@ -265,6 +310,60 @@ async def on_member_remove(member: discord.Member):
         if channel:
             await channel.send(f"**{member}** wyszedł z serwera")
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    global TEMP_ENABLED, TEMP_MAX_CHANNELS, TEMP_DELETE_SECONDS
+    if not TEMP_ENABLED or not TEMP_HUB_CHANNEL_ID:
+        return
+    # Dołączanie do huba → stwórz temp
+    if after.channel and after.channel.id == TEMP_HUB_CHANNEL_ID:
+        owned = sum(1 for cid, oid in temp_channels.items() if oid == member.id)
+        if owned >= TEMP_MAX_CHANNELS:
+            try:
+                await member.move_to(None)
+            except Exception:
+                pass
+            return
+        category = bot.get_channel(TEMP_CATEGORY_ID) if TEMP_CATEGORY_ID else after.channel.category
+        try:
+            overwrites = {
+                member.guild.default_role: discord.PermissionOverwrite(connect=True, view_channel=True),
+                member: discord.PermissionOverwrite(manage_channels=True, move_members=True, mute_members=True),
+            }
+            new_ch = await member.guild.create_voice_channel(
+                name=f"🔊 {member.display_name}",
+                category=category,
+                overwrites=overwrites,
+                reason="Temp VC"
+            )
+            temp_channels[new_ch.id] = member.id
+            await member.move_to(new_ch)
+        except Exception as e:
+            print(f"Temp VC error: {e}")
+    # Opuszczanie temp → usuń po czasie
+    if before.channel and before.channel.id in temp_channels:
+        if len(before.channel.members) == 0:
+            ch_id = before.channel.id
+            async def delete_later():
+                await asyncio.sleep(TEMP_DELETE_SECONDS)
+                ch = bot.get_channel(ch_id)
+                if ch and len(ch.members) == 0:
+                    try:
+                        await ch.delete(reason="Temp VC pusty")
+                    except Exception:
+                        pass
+                    temp_channels.pop(ch_id, None)
+            asyncio.create_task(delete_later())
+
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        return
+    # Proste XP za wiadomości
+    credits, _, _, _, _, text_xp, _ = await get_economy(message.author.id)
+    new_xp = text_xp + random.randint(5, 15)
+    await set_economy(message.author.id, text_xp=new_xp)
+    await bot.process_commands(message)
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -278,9 +377,10 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     await interaction.response.send_message(f"❌ Wystąpił błąd: `{str(error)[:200]}`", ephemeral=True)
     print(f"[ERROR] {error}")
 
+# ===================== MODERACJA (istniejące + rozszerzone) =====================
 
 @bot.tree.command(name="ban", description="Zbanuj użytkownika (można z czasem)")
-@app_commands.describe(uzytkownik="Kogo zbanować (@mention lub ID)", powod="Powód (dokładnie to poleci na PV)", czas="Opcjonalnie: 10m, 1h, 1d, 1w (puste = permanentny)")
+@app_commands.describe(uzytkownik="Kogo zbanować", powod="Powód", czas="np. 10m, 1h, 1d (puste = permanentny)")
 @is_mod()
 async def ban(interaction: discord.Interaction, uzytkownik: discord.User, powod: str = "Brak powodu", czas: str = None):
     member = interaction.guild.get_member(uzytkownik.id)
@@ -309,7 +409,6 @@ async def ban(interaction: discord.Interaction, uzytkownik: discord.User, powod:
                 pass
         asyncio.create_task(unban_later())
 
-
 @bot.tree.command(name="unban", description="Odbanuj użytkownika (podaj ID)")
 @app_commands.describe(uzytkownik_id="ID użytkownika", powod="Powód")
 @is_mod()
@@ -327,9 +426,8 @@ async def unban(interaction: discord.Interaction, uzytkownik_id: str, powod: str
     except Exception:
         await interaction.response.send_message("❌ Nie znaleziono użytkownika lub nie jest zbanowany.\nPodaj **ID**.", ephemeral=True)
 
-
 @bot.tree.command(name="softban", description="Softban (ban + od razu unban)")
-@app_commands.describe(uzytkownik="Kogo", powod="Powód (dokładnie to poleci na PV)")
+@app_commands.describe(uzytkownik="Kogo", powod="Powód")
 @is_mod()
 async def softban(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str = "Brak powodu"):
     if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
@@ -344,9 +442,8 @@ async def softban(interaction: discord.Interaction, uzytkownik: discord.Member, 
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
 
-
 @bot.tree.command(name="kick", description="Wyrzuć użytkownika")
-@app_commands.describe(uzytkownik="Kogo", powod="Powód (dokładnie to poleci na PV)")
+@app_commands.describe(uzytkownik="Kogo", powod="Powód")
 @is_mod()
 async def kick(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str = "Brak powodu"):
     if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
@@ -360,9 +457,8 @@ async def kick(interaction: discord.Interaction, uzytkownik: discord.Member, pow
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
 
-
 @bot.tree.command(name="mute", description="Wycisz użytkownika (timeout)")
-@app_commands.describe(uzytkownik="Kogo", czas="np. 10m, 1h, 2h 30m, 1d", powod="Powód (dokładnie to poleci na PV)")
+@app_commands.describe(uzytkownik="Kogo", czas="np. 10m, 1h, 1d", powod="Powód")
 @is_mod()
 async def mute(interaction: discord.Interaction, uzytkownik: discord.Member, czas: str, powod: str = "Brak powodu"):
     if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
@@ -382,8 +478,7 @@ async def mute(interaction: discord.Interaction, uzytkownik: discord.Member, cza
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
 
-
-@bot.tree.command(name="unmute", description="Zdejmij wyciszenie")
+@bot.tree.command(name="unmute", description="Zdejmij wyciszenie (timeout)")
 @app_commands.describe(uzytkownik="Komu")
 @is_mod()
 async def unmute(interaction: discord.Interaction, uzytkownik: discord.Member):
@@ -395,9 +490,108 @@ async def unmute(interaction: discord.Interaction, uzytkownik: discord.Member):
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
 
+@bot.tree.command(name="timeout", description="Timeout użytkownika")
+@app_commands.describe(uzytkownik="Kogo", czas="np. 10m, 1h", powod="Powód")
+@is_mod()
+async def timeout_cmd(interaction: discord.Interaction, uzytkownik: discord.Member, czas: str, powod: str = "Brak powodu"):
+    await mute(interaction, uzytkownik, czas, powod)
+
+@bot.tree.command(name="untimeout", description="Zdejmij timeout")
+@app_commands.describe(uzytkownik="Komu")
+@is_mod()
+async def untimeout_cmd(interaction: discord.Interaction, uzytkownik: discord.Member):
+    await unmute(interaction, uzytkownik)
+
+@bot.tree.command(name="mutetext", description="Wycisz tekstowo (nie może pisać)")
+@app_commands.describe(uzytkownik="Kogo", czas="opcjonalnie", powod="Powód")
+@is_mod()
+async def mutetext(interaction: discord.Interaction, uzytkownik: discord.Member, czas: str = None, powod: str = "Brak powodu"):
+    if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+        return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
+    for channel in interaction.guild.text_channels:
+        overwrite = channel.overwrites_for(uzytkownik)
+        overwrite.send_messages = False
+        try:
+            await channel.set_permissions(uzytkownik, overwrite=overwrite, reason=powod)
+        except Exception:
+            pass
+    delta = parse_time(czas) if czas else None
+    if delta:
+        until = (datetime.utcnow() + delta).isoformat()
+        async with aiosqlite.connect("moderation.db") as db:
+            await db.execute("INSERT OR REPLACE INTO muted_text (user_id, until) VALUES (?, ?)", (uzytkownik.id, until))
+            await db.commit()
+        async def unmute_later():
+            await asyncio.sleep(delta.total_seconds())
+            for channel in interaction.guild.text_channels:
+                try:
+                    await channel.set_permissions(uzytkownik, overwrite=None)
+                except Exception:
+                    pass
+            async with aiosqlite.connect("moderation.db") as db:
+                await db.execute("DELETE FROM muted_text WHERE user_id = ?", (uzytkownik.id,))
+                await db.commit()
+        asyncio.create_task(unmute_later())
+    embed = discord.Embed(title="🔇 Text Mute", color=0x808080, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=uzytkownik.mention)
+    embed.add_field(name="Moderator", value=interaction.user.mention)
+    embed.add_field(name="Powód", value=powod, inline=False)
+    if delta:
+        embed.add_field(name="Czas", value=format_time(delta))
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
+
+@bot.tree.command(name="unmutetext", description="Odcisz tekstowo")
+@app_commands.describe(uzytkownik="Komu")
+@is_mod()
+async def unmutetext(interaction: discord.Interaction, uzytkownik: discord.Member):
+    for channel in interaction.guild.text_channels:
+        try:
+            await channel.set_permissions(uzytkownik, overwrite=None)
+        except Exception:
+            pass
+    async with aiosqlite.connect("moderation.db") as db:
+        await db.execute("DELETE FROM muted_text WHERE user_id = ?", (uzytkownik.id,))
+        await db.commit()
+    embed = discord.Embed(title="🔊 Text Unmute", color=0x00FF00, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=uzytkownik.mention)
+    embed.add_field(name="Moderator", value=interaction.user.mention)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
+
+@bot.tree.command(name="mutevoice", description="Wycisz głosowo (nie może mówić)")
+@app_commands.describe(uzytkownik="Kogo", powod="Powód")
+@is_mod()
+async def mutevoice(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str = "Brak powodu"):
+    if uzytkownik.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+        return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
+    try:
+        await uzytkownik.edit(mute=True, reason=powod)
+    except Exception:
+        return await interaction.response.send_message("❌ Nie mogę wyciszyć (brak uprawnień lub nie jest na VC).", ephemeral=True)
+    embed = discord.Embed(title="🔇 Voice Mute", color=0x808080, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=uzytkownik.mention)
+    embed.add_field(name="Moderator", value=interaction.user.mention)
+    embed.add_field(name="Powód", value=powod, inline=False)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
+
+@bot.tree.command(name="unmutevoice", description="Odcisz głosowo")
+@app_commands.describe(uzytkownik="Komu")
+@is_mod()
+async def unmutevoice(interaction: discord.Interaction, uzytkownik: discord.Member):
+    try:
+        await uzytkownik.edit(mute=False)
+    except Exception:
+        return await interaction.response.send_message("❌ Nie mogę odciszyć.", ephemeral=True)
+    embed = discord.Embed(title="🔊 Voice Unmute", color=0x00FF00, timestamp=datetime.utcnow())
+    embed.add_field(name="Użytkownik", value=uzytkownik.mention)
+    embed.add_field(name="Moderator", value=interaction.user.mention)
+    await interaction.response.send_message(embed=embed)
+    await send_log(embed, skip_channel_id=interaction.channel_id)
 
 @bot.tree.command(name="warn", description="Ostrzeż użytkownika")
-@app_commands.describe(uzytkownik="Kogo", powod="Powód (dokładnie to poleci na PV)")
+@app_commands.describe(uzytkownik="Kogo", powod="Powód")
 @is_mod()
 async def warn(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str):
     async with aiosqlite.connect("moderation.db") as db:
@@ -415,7 +609,6 @@ async def warn(interaction: discord.Interaction, uzytkownik: discord.Member, pow
     await send_log(embed, skip_channel_id=interaction.channel_id)
     await notify_user(uzytkownik, interaction.guild, action="warned", color=0xFFFF00, reason=powod, extra=f"Łączna liczba ostrzeżeń: **{count}**")
 
-
 @bot.tree.command(name="warnings", description="Sprawdź ostrzeżenia")
 @app_commands.describe(uzytkownik="Kogo")
 @is_mod()
@@ -431,7 +624,6 @@ async def warnings(interaction: discord.Interaction, uzytkownik: discord.Member)
     embed.set_footer(text=f"Łącznie: {len(rows)}")
     await interaction.response.send_message(embed=embed)
 
-
 @bot.tree.command(name="clearwarns", description="Wyczyść wszystkie warny")
 @app_commands.describe(uzytkownik="Kogo")
 @is_mod()
@@ -445,6 +637,11 @@ async def clearwarns(interaction: discord.Interaction, uzytkownik: discord.Membe
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
 
+@bot.tree.command(name="warn_remove", description="Usuń warny (jak clearwarns)")
+@app_commands.describe(uzytkownik="Kogo")
+@is_mod()
+async def warn_remove(interaction: discord.Interaction, uzytkownik: discord.Member):
+    await clearwarns(interaction, uzytkownik)
 
 @bot.tree.command(name="clear", description="Usuń wiadomości")
 @app_commands.describe(ilosc="1-100")
@@ -456,7 +653,6 @@ async def clear(interaction: discord.Interaction, ilosc: app_commands.Range[int,
     await interaction.followup.send(embed=embed, ephemeral=True)
     await send_log(embed)
 
-
 @bot.tree.command(name="slowmode", description="Ustaw slowmode")
 @app_commands.describe(sekundy="0 = wyłącz")
 @is_mod()
@@ -465,7 +661,6 @@ async def slowmode(interaction: discord.Interaction, sekundy: app_commands.Range
     embed = discord.Embed(title="🐌 Slowmode", description=f"Ustawiono na **{sekundy}s**", color=0x9B59B6)
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
-
 
 @bot.tree.command(name="lock", description="Zablokuj kanał")
 @is_mod()
@@ -477,7 +672,6 @@ async def lock(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
 
-
 @bot.tree.command(name="unlock", description="Odblokuj kanał")
 @is_mod()
 async def unlock(interaction: discord.Interaction):
@@ -487,7 +681,6 @@ async def unlock(interaction: discord.Interaction):
     embed = discord.Embed(title="🔓 Kanał odblokowany", color=0x2ECC71)
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
-
 
 @bot.tree.command(name="nick", description="Zmień nick")
 @app_commands.describe(uzytkownik="Kogo", nowy_nick="Nowy nick")
@@ -502,6 +695,13 @@ async def nick(interaction: discord.Interaction, uzytkownik: discord.Member, now
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
 
+@bot.tree.command(name="setnick", description="Zmień nick (alias)")
+@app_commands.describe(uzytkownik="Kogo", nowy_nick="Nowy nick")
+@is_mod()
+async def setnick(interaction: discord.Interaction, uzytkownik: discord.Member, nowy_nick: str = None):
+    await nick(interaction, uzytkownik, nowy_nick)
+
+# ===================== INFO =====================
 
 @bot.tree.command(name="userinfo", description="Info o użytkowniku")
 @app_commands.describe(uzytkownik="Kogo")
@@ -517,6 +717,10 @@ async def userinfo(interaction: discord.Interaction, uzytkownik: Optional[discor
     embed.add_field(name=f"Role ({len(roles)})", value=" ".join(roles[:12]) or "Brak", inline=False)
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="user", description="Info o użytkowniku (alias)")
+@app_commands.describe(uzytkownik="Kogo")
+async def user_cmd(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
+    await userinfo(interaction, uzytkownik)
 
 @bot.tree.command(name="serverinfo", description="Info o serwerze")
 async def serverinfo(interaction: discord.Interaction):
@@ -527,8 +731,51 @@ async def serverinfo(interaction: discord.Interaction):
     embed.add_field(name="Właściciel", value=g.owner.mention if g.owner else "?", inline=True)
     embed.add_field(name="Członkowie", value=g.member_count, inline=True)
     embed.add_field(name="Kanały", value=len(g.channels), inline=True)
+    embed.add_field(name="Role", value=len(g.roles), inline=True)
+    embed.add_field(name="Boosty", value=g.premium_subscription_count or 0, inline=True)
+    embed.add_field(name="Utworzony", value=f"<t:{int(g.created_at.timestamp())}:R>", inline=True)
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="server", description="Info o serwerze (alias)")
+async def server_cmd(interaction: discord.Interaction):
+    await serverinfo(interaction)
+
+@bot.tree.command(name="avatar", description="Pokaż avatar")
+@app_commands.describe(uzytkownik="Kogo")
+async def avatar(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
+    user = uzytkownik or interaction.user
+    embed = discord.Embed(title=f"Avatar — {user}", color=0x5865F2)
+    embed.set_image(url=user.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="roles", description="Lista ról serwera")
+async def roles_cmd(interaction: discord.Interaction):
+    roles = sorted([r for r in interaction.guild.roles if r != interaction.guild.default_role], key=lambda r: r.position, reverse=True)
+    tekst = "\n".join([f"{r.mention} — {len(r.members)} osób" for r in roles[:25]])
+    embed = discord.Embed(title=f"Role serwera ({len(roles)})", description=tekst or "Brak", color=0x5865F2)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="ping", description="Sprawdź opóźnienie bota")
+async def ping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! `{latency}ms`")
+
+@bot.tree.command(name="help", description="Lista komend")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="📚 Pomoc — komendy bota", color=0x5865F2, description="Wszystkie komendy slash `/`")
+    embed.add_field(name="Moderacja", value="`/ban` `/kick` `/mute` `/unmute` `/timeout` `/mutetext` `/mutevoice` `/warn` `/clear` `/lock` `/unlock` `/slowmode` `/nick`", inline=False)
+    embed.add_field(name="Info", value="`/user` `/server` `/avatar` `/roles` `/ping` `/invites`", inline=False)
+    embed.add_field(name="Kolory", value="`/color` `/colors` `/setcolor`", inline=False)
+    embed.add_field(name="Ekonomia & Level", value="`/credits` `/daily` `/rep` `/rank` `/profile` `/title` `/top` `/points`", inline=False)
+    embed.add_field(name="Głos", value="`/moveme` `/move` `/moveall` `/vkick`", inline=False)
+    embed.add_field(name="Inne", value="`/roll` `/short` `/rolegive` `/roleremove`", inline=False)
+    embed.add_field(name="Temp VC", value="`/tempon` `/tempoff` `/tempmax` `/temptime`", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="invite", description="Link do zaproszenia bota")
+async def invite_cmd(interaction: discord.Interaction):
+    url = discord.utils.oauth_url(bot.user.id, permissions=discord.Permissions(administrator=True))
+    await interaction.response.send_message(f"🔗 Zaproś bota: {url}")
 
 @bot.tree.command(name="invites", description="Kto kogo zaprosił")
 @app_commands.describe(uzytkownik="Opcjonalnie")
@@ -547,5 +794,350 @@ async def invites(interaction: discord.Interaction, uzytkownik: Optional[discord
         embed.add_field(name="Ostatnie", value="Brak danych", inline=False)
     await interaction.response.send_message(embed=embed)
 
+# ===================== KOLORY =====================
+
+@bot.tree.command(name="colors", description="Lista dostępnych kolorów")
+async def colors(interaction: discord.Interaction):
+    color_roles = []
+    for r in interaction.guild.roles:
+        if r.name.isdigit() and 1 <= int(r.name) <= 100:
+            color_roles.append(r)
+    color_roles.sort(key=lambda r: int(r.name))
+    if not color_roles:
+        return await interaction.response.send_message("❌ Brak ról kolorów.\nStwórz role nazwane `1`, `2`, `3`... z kolorami.", ephemeral=True)
+    tekst = "\n".join([f"**{r.name}** — {r.mention}" for r in color_roles[:30]])
+    embed = discord.Embed(title="🎨 Dostępne kolory", description=tekst, color=0x5865F2)
+    embed.set_footer(text="Użyj /color numer")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="color", description="Zmień swój kolor")
+@app_commands.describe(numer="Numer koloru (0 = usuń)")
+async def color(interaction: discord.Interaction, numer: int):
+    member = interaction.user
+    # Usuń stare kolory
+    for r in member.roles:
+        if r.name.isdigit() and 1 <= int(r.name) <= 100:
+            try:
+                await member.remove_roles(r, reason="Zmiana koloru")
+            except Exception:
+                pass
+    if numer == 0:
+        return await interaction.response.send_message("✅ Kolor zresetowany.")
+    role = discord.utils.get(interaction.guild.roles, name=str(numer))
+    if not role:
+        return await interaction.response.send_message(f"❌ Nie ma koloru **{numer}**. Sprawdź `/colors`.", ephemeral=True)
+    try:
+        await member.add_roles(role, reason="Kolor")
+        await interaction.response.send_message(f"✅ Ustawiono kolor **{numer}** {role.mention}")
+    except Exception:
+        await interaction.response.send_message("❌ Nie mogę dać roli (hierarchia / uprawnienia).", ephemeral=True)
+
+@bot.tree.command(name="setcolor", description="Zmień kolor roli (hex)")
+@app_commands.describe(rola="Rola", hex_color="np. #FF0000 lub FF0000")
+@is_mod()
+async def setcolor(interaction: discord.Interaction, rola: discord.Role, hex_color: str):
+    hex_color = hex_color.lstrip("#")
+    try:
+        color_int = int(hex_color, 16)
+        await rola.edit(color=discord.Color(color_int))
+        await interaction.response.send_message(f"✅ Kolor roli {rola.mention} zmieniony na `#{hex_color}`")
+    except Exception:
+        await interaction.response.send_message("❌ Zły hex lub brak uprawnień.", ephemeral=True)
+
+# ===================== EKONOMIA & LEVEL =====================
+
+@bot.tree.command(name="credits", description="Sprawdź kredyty / przelej")
+@app_commands.describe(uzytkownik="Kogo sprawdzić", kwota="Ile przelać (opcjonalnie)")
+async def credits(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None, kwota: Optional[int] = None):
+    target = uzytkownik or interaction.user
+    if kwota is not None and kwota > 0 and target.id != interaction.user.id:
+        my_credits, *_ = await get_economy(interaction.user.id)
+        if my_credits < kwota:
+            return await interaction.response.send_message("❌ Za mało kredytów.", ephemeral=True)
+        await set_economy(interaction.user.id, credits=my_credits - kwota)
+        their, *_ = await get_economy(target.id)
+        await set_economy(target.id, credits=their + kwota)
+        return await interaction.response.send_message(f"✅ Przelano **{kwota}** kredytów do {target.mention}")
+    creds, _, rep, _, title, text_xp, voice_xp = await get_economy(target.id)
+    embed = discord.Embed(title=f"💰 Kredyty — {target.display_name}", color=0xF1C40F)
+    embed.add_field(name="Kredyty", value=str(creds))
+    embed.add_field(name="Rep", value=str(rep))
+    embed.add_field(name="Tytuł", value=title or "Brak")
+    embed.set_thumbnail(url=target.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="daily", description="Odbierz codzienną nagrodę")
+async def daily(interaction: discord.Interaction):
+    creds, last_daily, *_ = await get_economy(interaction.user.id)
+    now = datetime.utcnow()
+    if last_daily:
+        last = datetime.fromisoformat(last_daily)
+        if (now - last).total_seconds() < 86400:
+            left = 86400 - (now - last).total_seconds()
+            return await interaction.response.send_message(f"⏳ Daily dostępne za **{format_time_human(timedelta(seconds=int(left)))}**", ephemeral=True)
+    reward = random.randint(50, 150)
+    await set_economy(interaction.user.id, credits=creds + reward, last_daily=now.isoformat())
+    await interaction.response.send_message(f"🎁 Otrzymałeś **{reward}** kredytów! Masz teraz **{creds + reward}**.")
+
+@bot.tree.command(name="rep", description="Daj komuś reputację (1x na 24h)")
+@app_commands.describe(uzytkownik="Komu")
+async def rep(interaction: discord.Interaction, uzytkownik: discord.Member):
+    if uzytkownik.id == interaction.user.id:
+        return await interaction.response.send_message("❌ Nie możesz dać rep sobie.", ephemeral=True)
+    _, _, _, last_rep, *_ = await get_economy(interaction.user.id)
+    now = datetime.utcnow()
+    if last_rep:
+        last = datetime.fromisoformat(last_rep)
+        if (now - last).total_seconds() < 86400:
+            left = 86400 - (now - last).total_seconds()
+            return await interaction.response.send_message(f"⏳ Możesz dać rep za **{format_time_human(timedelta(seconds=int(left)))}**", ephemeral=True)
+    their_creds, _, their_rep, *_ = await get_economy(uzytkownik.id)
+    await set_economy(uzytkownik.id, rep=their_rep + 1)
+    await set_economy(interaction.user.id, last_rep=now.isoformat())
+    await interaction.response.send_message(f"⭐ Dałeś **+1 rep** użytkownikowi {uzytkownik.mention}!")
+
+@bot.tree.command(name="title", description="Ustaw tytuł w profilu")
+@app_commands.describe(tytul="Nowy tytuł")
+async def title(interaction: discord.Interaction, tytul: str):
+    if len(tytul) > 32:
+        return await interaction.response.send_message("❌ Max 32 znaki.", ephemeral=True)
+    await set_economy(interaction.user.id, title=tytul)
+    await interaction.response.send_message(f"✅ Tytuł ustawiony na: **{tytul}**")
+
+@bot.tree.command(name="rank", description="Karta rangi")
+@app_commands.describe(uzytkownik="Kogo")
+async def rank(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
+    user = uzytkownik or interaction.user
+    _, _, rep, _, title, text_xp, voice_xp = await get_economy(user.id)
+    level = xp_to_level(text_xp)
+    next_xp = level_to_xp(level + 1)
+    embed = discord.Embed(title=f"📊 Rank — {user.display_name}", color=user.color or 0x5865F2)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="Poziom", value=str(level))
+    embed.add_field(name="XP", value=f"{text_xp} / {next_xp}")
+    embed.add_field(name="Rep", value=str(rep))
+    if title:
+        embed.add_field(name="Tytuł", value=title, inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="profile", description="Profil użytkownika")
+@app_commands.describe(uzytkownik="Kogo")
+async def profile(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
+    user = uzytkownik or interaction.user
+    creds, _, rep, _, title, text_xp, voice_xp = await get_economy(user.id)
+    pts = await get_points(user.id)
+    level = xp_to_level(text_xp)
+    embed = discord.Embed(title=f"👤 Profil — {user.display_name}", color=user.color or 0x5865F2)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="Kredyty", value=str(creds))
+    embed.add_field(name="Punkty", value=str(pts))
+    embed.add_field(name="Rep", value=str(rep))
+    embed.add_field(name="Poziom", value=str(level))
+    embed.add_field(name="XP", value=str(text_xp))
+    if title:
+        embed.add_field(name="Tytuł", value=title, inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="top", description="Top XP")
+async def top(interaction: discord.Interaction):
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute("SELECT user_id, text_xp FROM economy ORDER BY text_xp DESC LIMIT 10")
+        rows = await cur.fetchall()
+    if not rows:
+        return await interaction.response.send_message("Brak danych.")
+    tekst = ""
+    for i, (uid, xp) in enumerate(rows, 1):
+        tekst += f"**{i}.** <@{uid}> — {xp} XP (lvl {xp_to_level(xp)})\n"
+    embed = discord.Embed(title="🏆 Top XP", description=tekst, color=0xF1C40F)
+    await interaction.response.send_message(embed=embed)
+
+# ===================== PUNKTY =====================
+
+points = app_commands.Group(name="points", description="System punktów")
+
+@points.command(name="increase", description="Dodaj punkty")
+@app_commands.describe(uzytkownik="Komu", ilosc="Ile")
+@is_mod()
+async def points_increase(interaction: discord.Interaction, uzytkownik: discord.Member, ilosc: int):
+    current = await get_points(uzytkownik.id)
+    await set_points(uzytkownik.id, current + ilosc)
+    await interaction.response.send_message(f"✅ Dodano **{ilosc}** punktów {uzytkownik.mention}. Ma teraz **{current + ilosc}**.")
+
+@points.command(name="decrease", description="Odejmij punkty")
+@app_commands.describe(uzytkownik="Komu", ilosc="Ile")
+@is_mod()
+async def points_decrease(interaction: discord.Interaction, uzytkownik: discord.Member, ilosc: int):
+    current = await get_points(uzytkownik.id)
+    await set_points(uzytkownik.id, current - ilosc)
+    await interaction.response.send_message(f"✅ Odjęto **{ilosc}** punktów {uzytkownik.mention}. Ma teraz **{max(0, current - ilosc)}**.")
+
+@points.command(name="set", description="Ustaw punkty")
+@app_commands.describe(uzytkownik="Komu", ilosc="Ile")
+@is_mod()
+async def points_set(interaction: discord.Interaction, uzytkownik: discord.Member, ilosc: int):
+    await set_points(uzytkownik.id, ilosc)
+    await interaction.response.send_message(f"✅ Ustawiono **{ilosc}** punktów dla {uzytkownik.mention}.")
+
+@points.command(name="list", description="Lista punktów")
+async def points_list(interaction: discord.Interaction):
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute("SELECT user_id, points FROM points WHERE points > 0 ORDER BY points DESC LIMIT 15")
+        rows = await cur.fetchall()
+    if not rows:
+        return await interaction.response.send_message("Brak punktów.")
+    tekst = "\n".join([f"**{i}.** <@{uid}> — **{pts}**" for i, (uid, pts) in enumerate(rows, 1)])
+    embed = discord.Embed(title="📊 Punkty", description=tekst, color=0x3498DB)
+    await interaction.response.send_message(embed=embed)
+
+@points.command(name="reset", description="Reset punktów")
+@app_commands.describe(uzytkownik="Kogo (puste = wszyscy)")
+@is_mod()
+async def points_reset(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
+    async with aiosqlite.connect("moderation.db") as db:
+        if uzytkownik:
+            await db.execute("UPDATE points SET points = 0 WHERE user_id = ?", (uzytkownik.id,))
+            msg = f"✅ Zresetowano punkty {uzytkownik.mention}."
+        else:
+            await db.execute("UPDATE points SET points = 0")
+            msg = "✅ Zresetowano wszystkie punkty."
+        await db.commit()
+    await interaction.response.send_message(msg)
+
+bot.tree.add_command(points)
+
+# ===================== GŁOS =====================
+
+@bot.tree.command(name="moveme", description="Przenieś się na inny kanał głosowy")
+@app_commands.describe(kanal="Kanał głosowy")
+async def moveme(interaction: discord.Interaction, kanal: discord.VoiceChannel):
+    if not interaction.user.voice:
+        return await interaction.response.send_message("❌ Musisz być na kanale głosowym.", ephemeral=True)
+    try:
+        await interaction.user.move_to(kanal)
+        await interaction.response.send_message(f"✅ Przeniesiono Cię na {kanal.mention}")
+    except Exception:
+        await interaction.response.send_message("❌ Nie mogę Cię przenieść.", ephemeral=True)
+
+@bot.tree.command(name="move", description="Przenieś użytkownika na kanał głosowy")
+@app_commands.describe(uzytkownik="Kogo", kanal="Dokąd")
+@is_mod()
+async def move(interaction: discord.Interaction, uzytkownik: discord.Member, kanal: discord.VoiceChannel):
+    if not uzytkownik.voice:
+        return await interaction.response.send_message("❌ Użytkownik nie jest na VC.", ephemeral=True)
+    try:
+        await uzytkownik.move_to(kanal)
+        await interaction.response.send_message(f"✅ Przeniesiono {uzytkownik.mention} na {kanal.mention}")
+    except Exception:
+        await interaction.response.send_message("❌ Nie mogę przenieść.", ephemeral=True)
+
+@bot.tree.command(name="moveall", description="Przenieś wszystkich z Twojego VC")
+@app_commands.describe(kanal="Dokąd")
+@is_mod()
+async def moveall(interaction: discord.Interaction, kanal: discord.VoiceChannel):
+    if not interaction.user.voice:
+        return await interaction.response.send_message("❌ Musisz być na kanale głosowym.", ephemeral=True)
+    source = interaction.user.voice.channel
+    count = 0
+    for m in source.members:
+        try:
+            await m.move_to(kanal)
+            count += 1
+        except Exception:
+            pass
+    await interaction.response.send_message(f"✅ Przeniesiono **{count}** osób na {kanal.mention}")
+
+@bot.tree.command(name="vkick", description="Wyrzuć z kanału głosowego")
+@app_commands.describe(uzytkownik="Kogo")
+@is_mod()
+async def vkick(interaction: discord.Interaction, uzytkownik: discord.Member):
+    if not uzytkownik.voice:
+        return await interaction.response.send_message("❌ Użytkownik nie jest na VC.", ephemeral=True)
+    try:
+        await uzytkownik.move_to(None)
+        await interaction.response.send_message(f"✅ Wyrzucono {uzytkownik.mention} z VC.")
+    except Exception:
+        await interaction.response.send_message("❌ Nie mogę wyrzucić.", ephemeral=True)
+
+# ===================== ROLE =====================
+
+@bot.tree.command(name="rolegive", description="Daj rolę")
+@app_commands.describe(uzytkownik="Komu", rola="Jaka rola")
+@is_mod()
+async def rolegive(interaction: discord.Interaction, uzytkownik: discord.Member, rola: discord.Role):
+    if rola >= interaction.user.top_role and interaction.user != interaction.guild.owner:
+        return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
+    try:
+        await uzytkownik.add_roles(rola, reason=f"Przez {interaction.user}")
+        await interaction.response.send_message(f"✅ Nadano {rola.mention} użytkownikowi {uzytkownik.mention}")
+    except Exception:
+        await interaction.response.send_message("❌ Nie mogę nadać roli.", ephemeral=True)
+
+@bot.tree.command(name="roleremove", description="Zdejmij rolę")
+@app_commands.describe(uzytkownik="Komu", rola="Jaka rola")
+@is_mod()
+async def roleremove(interaction: discord.Interaction, uzytkownik: discord.Member, rola: discord.Role):
+    try:
+        await uzytkownik.remove_roles(rola, reason=f"Przez {interaction.user}")
+        await interaction.response.send_message(f"✅ Zdjętо {rola.mention} użytkownikowi {uzytkownik.mention}")
+    except Exception:
+        await interaction.response.send_message("❌ Nie mogę zdjąć roli.", ephemeral=True)
+
+# ===================== INNE =====================
+
+@bot.tree.command(name="roll", description="Rzuć kostką")
+@app_commands.describe(max="Maksymalna liczba (domyślnie 6)")
+async def roll(interaction: discord.Interaction, max: app_commands.Range[int, 2, 1000] = 6):
+    wynik = random.randint(1, max)
+    await interaction.response.send_message(f"🎲 Wyrzucono: **{wynik}** (1-{max})")
+
+@bot.tree.command(name="short", description="Skróć link")
+@app_commands.describe(url="Link do skrócenia")
+async def short(interaction: discord.Interaction, url: str):
+    if not url.startswith("http"):
+        url = "https://" + url
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://is.gd/create.php?format=simple&url={url}") as resp:
+                if resp.status == 200:
+                    short_url = await resp.text()
+                    await interaction.response.send_message(f"🔗 Skrócony link: {short_url}")
+                else:
+                    await interaction.response.send_message("❌ Nie udało się skrócić.", ephemeral=True)
+    except Exception:
+        await interaction.response.send_message("❌ Błąd przy skracaniu.", ephemeral=True)
+
+# ===================== TEMP VC =====================
+
+@bot.tree.command(name="tempon", description="Włącz tymczasowe kanały VC")
+@is_mod()
+async def tempon(interaction: discord.Interaction):
+    global TEMP_ENABLED
+    TEMP_ENABLED = True
+    await interaction.response.send_message("✅ Temp VC włączone.\nUstaw `TEMP_HUB_CHANNEL_ID` i `TEMP_CATEGORY_ID` w env.")
+
+@bot.tree.command(name="tempoff", description="Wyłącz tymczasowe kanały VC")
+@is_mod()
+async def tempoff(interaction: discord.Interaction):
+    global TEMP_ENABLED
+    TEMP_ENABLED = False
+    await interaction.response.send_message("✅ Temp VC wyłączone.")
+
+@bot.tree.command(name="tempmax", description="Max kanałów na osobę")
+@app_commands.describe(ilosc="Ile max")
+@is_mod()
+async def tempmax(interaction: discord.Interaction, ilosc: app_commands.Range[int, 1, 10]):
+    global TEMP_MAX_CHANNELS
+    TEMP_MAX_CHANNELS = ilosc
+    await interaction.response.send_message(f"✅ Max kanałów na osobę: **{ilosc}**")
+
+@bot.tree.command(name="temptime", description="Czas usuwania pustego temp VC (sekundy)")
+@app_commands.describe(sekundy="Po ilu sekundach usunąć")
+@is_mod()
+async def temptime(interaction: discord.Interaction, sekundy: app_commands.Range[int, 5, 600]):
+    global TEMP_DELETE_SECONDS
+    TEMP_DELETE_SECONDS = sekundy
+    await interaction.response.send_message(f"✅ Czas usuwania pustego temp: **{sekundy}s**")
+
+# ===================== START =====================
 
 bot.run(TOKEN)
