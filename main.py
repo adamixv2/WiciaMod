@@ -8,7 +8,7 @@ import aiohttp
 import io
 import asyncio
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 
@@ -152,7 +152,7 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
     lines = {
         "muted": f"Zostałeś wyciszony na serwerze **{server}**" + (f" na **{duration}**" if duration else "") + f". | {reason}",
         "unmuted": f"Wyciszenie na serwerze **{server}** zostało zdjęte.",
-        "banned": f"Zostałeś zbanowany na serwerze **{server}**" + (f" na **{duration}**" if duration else "") + f". | {reason}",
+        "banned": f"Zostałeś zbanowany na serwerze **{server}** na **{duration or 'zawsze'}**. | {reason}",
         "unbanned": f"Zostałeś odbanowany na serwerze **{server}**. | {reason}",
         "kicked": f"Zostałeś wyrzucony z serwera **{server}**. | {reason}",
         "softbanned": f"Zostałeś softbanowany na serwerze **{server}**. | {reason}",
@@ -169,13 +169,15 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
     }
     line = lines.get(action, f"Powiadomienie z serwera **{server}**. | {reason}")
     plain = line.replace("**", "")
-    embed = discord.Embed(title=titles.get(action, "Powiadomienie"), description=line, color=color, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=titles.get(action, "Powiadomienie"), description=line, color=color, timestamp=datetime.now(timezone.utc))
     if guild and guild.icon:
         embed.set_author(name=server, icon_url=guild.icon.url)
     else:
         embed.set_author(name=server)
     embed.add_field(name="Serwer", value=server, inline=True)
-    if duration:
+    if action == "banned":
+        embed.add_field(name="Czas bana", value=duration or "Na zawsze", inline=True)
+    elif duration:
         embed.add_field(name="Czas", value=duration, inline=True)
     if action != "unmuted":
         embed.add_field(name="Powód", value=reason, inline=False)
@@ -358,7 +360,7 @@ async def on_member_join(member: discord.Member):
                 async with aiosqlite.connect("moderation.db") as db:
                     await db.execute(
                         "INSERT INTO invites (inviter_id, invited_id, code, timestamp) VALUES (?,?,?,?)",
-                        (inv.inviter.id if inv.inviter else 0, member.id, inv.code, datetime.utcnow().isoformat()),
+                        (inv.inviter.id if inv.inviter else 0, member.id, inv.code, datetime.now(timezone.utc).isoformat()),
                     )
                     await db.commit()
                 break
@@ -389,7 +391,7 @@ async def on_member_remove(member: discord.Member):
         channel = bot.get_channel(GOODBYE_CHANNEL_ID)
         if channel:
             try:
-                await channel.send(f"**{member}** wyszedł z serwera")
+                await channel.send(f"{member.mention} wyszedł z serwera")
             except Exception:
                 pass
 
@@ -476,10 +478,10 @@ async def cmd_ban(interaction: discord.Interaction, uzytkownik: discord.User, po
     if member and member.top_role >= interaction.user.top_role and interaction.user != interaction.guild.owner:
         return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
     delta = parse_time(czas) if czas else None
-    duration_human = format_time_human(delta) if delta else None
+    duration_human = format_time_human(delta) if delta else "zawsze"
     await notify_user(uzytkownik, interaction.guild, action="banned", color=0xFF0000, reason=powod, duration=duration_human)
     await interaction.guild.ban(uzytkownik, reason=f"{interaction.user} | {powod}" + (f" | {czas}" if czas else ""), delete_message_days=1)
-    embed = discord.Embed(title="🔨 Zbanowany", color=0xFF0000, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔨 Zbanowany", color=0xFF0000, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
@@ -506,7 +508,7 @@ async def cmd_unban(interaction: discord.Interaction, uzytkownik_id: str, powod:
         user = await bot.fetch_user(int(uzytkownik_id))
         await interaction.guild.unban(user, reason=f"{interaction.user} | {powod}")
         await notify_user(user, interaction.guild, action="unbanned", color=0x00FF00, reason=powod)
-        embed = discord.Embed(title="✅ Odbanowany", color=0x00FF00, timestamp=datetime.utcnow())
+        embed = discord.Embed(title="✅ Odbanowany", color=0x00FF00, timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Użytkownik", value=f"{user} (`{user.id}`)", inline=False)
         embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
         embed.add_field(name="Powód", value=powod, inline=False)
@@ -525,7 +527,7 @@ async def cmd_softban(interaction: discord.Interaction, uzytkownik: discord.Memb
     await notify_user(uzytkownik, interaction.guild, action="softbanned", color=0xFF4500, reason=powod, extra="Wiadomości z 7 dni usunięte.")
     await uzytkownik.ban(reason=f"Softban | {interaction.user} | {powod}", delete_message_days=7)
     await interaction.guild.unban(uzytkownik, reason="Softban")
-    embed = discord.Embed(title="💨 Softban", color=0xFF4500, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="💨 Softban", color=0xFF4500, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
@@ -541,7 +543,7 @@ async def cmd_kick(interaction: discord.Interaction, uzytkownik: discord.Member,
         return await interaction.response.send_message("❌ Za niska rola.", ephemeral=True)
     await notify_user(uzytkownik, interaction.guild, action="kicked", color=0xFFA500, reason=powod)
     await uzytkownik.kick(reason=f"{interaction.user} | {powod}")
-    embed = discord.Embed(title="👢 Wyrzucony", color=0xFFA500, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="👢 Wyrzucony", color=0xFFA500, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Powód", value=powod, inline=False)
@@ -562,7 +564,7 @@ async def cmd_mute(interaction: discord.Interaction, uzytkownik: discord.Member,
         return await interaction.response.send_message("❌ Max 28 dni.", ephemeral=True)
     await notify_user(uzytkownik, interaction.guild, action="muted", color=0x808080, reason=powod, duration=format_time_human(delta))
     await uzytkownik.timeout(delta, reason=f"{interaction.user} | {powod}")
-    embed = discord.Embed(title="🔇 Wyciszony", color=0x808080, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔇 Wyciszony", color=0x808080, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Czas", value=format_time(delta), inline=True)
@@ -577,7 +579,7 @@ async def cmd_mute(interaction: discord.Interaction, uzytkownik: discord.Member,
 async def cmd_unmute(interaction: discord.Interaction, uzytkownik: discord.Member):
     await uzytkownik.timeout(None)
     await notify_user(uzytkownik, interaction.guild, action="unmuted", color=0x00FF00, reason="Zdjęte przez moda")
-    embed = discord.Embed(title="🔊 Mute zdjęty", color=0x00FF00, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔊 Mute zdjęty", color=0x00FF00, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
@@ -597,7 +599,7 @@ async def cmd_timeout(interaction: discord.Interaction, uzytkownik: discord.Memb
         return await interaction.response.send_message("❌ Max 28 dni.", ephemeral=True)
     await notify_user(uzytkownik, interaction.guild, action="muted", color=0x808080, reason=powod, duration=format_time_human(delta))
     await uzytkownik.timeout(delta, reason=f"{interaction.user} | {powod}")
-    embed = discord.Embed(title="🔇 Timeout", color=0x808080, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔇 Timeout", color=0x808080, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Czas", value=format_time(delta), inline=True)
@@ -612,7 +614,7 @@ async def cmd_timeout(interaction: discord.Interaction, uzytkownik: discord.Memb
 async def cmd_untimeout(interaction: discord.Interaction, uzytkownik: discord.Member):
     await uzytkownik.timeout(None)
     await notify_user(uzytkownik, interaction.guild, action="unmuted", color=0x00FF00, reason="Zdjęte przez moda")
-    embed = discord.Embed(title="🔊 Timeout zdjęty", color=0x00FF00, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔊 Timeout zdjęty", color=0x00FF00, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
@@ -642,7 +644,7 @@ async def cmd_mutetext(interaction: discord.Interaction, uzytkownik: discord.Mem
                 except Exception:
                     pass
         asyncio.create_task(unmute_later())
-    embed = discord.Embed(title="🔇 Text Mute", color=0x808080, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔇 Text Mute", color=0x808080, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention)
     embed.add_field(name="Moderator", value=interaction.user.mention)
     embed.add_field(name="Powód", value=powod, inline=False)
@@ -661,7 +663,7 @@ async def cmd_unmutetext(interaction: discord.Interaction, uzytkownik: discord.M
             await channel.set_permissions(uzytkownik, overwrite=None)
         except Exception:
             pass
-    embed = discord.Embed(title="🔊 Text Unmute", color=0x00FF00, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔊 Text Unmute", color=0x00FF00, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention)
     embed.add_field(name="Moderator", value=interaction.user.mention)
     await interaction.response.send_message(embed=embed)
@@ -678,7 +680,7 @@ async def cmd_mutevoice(interaction: discord.Interaction, uzytkownik: discord.Me
         await uzytkownik.edit(mute=True, reason=powod)
     except Exception:
         return await interaction.response.send_message("❌ Nie mogę wyciszyć (brak uprawnień / nie na VC).", ephemeral=True)
-    embed = discord.Embed(title="🔇 Voice Mute", color=0x808080, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔇 Voice Mute", color=0x808080, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention)
     embed.add_field(name="Moderator", value=interaction.user.mention)
     embed.add_field(name="Powód", value=powod, inline=False)
@@ -694,7 +696,7 @@ async def cmd_unmutevoice(interaction: discord.Interaction, uzytkownik: discord.
         await uzytkownik.edit(mute=False)
     except Exception:
         return await interaction.response.send_message("❌ Nie mogę odciszyć.", ephemeral=True)
-    embed = discord.Embed(title="🔊 Voice Unmute", color=0x00FF00, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🔊 Voice Unmute", color=0x00FF00, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention)
     embed.add_field(name="Moderator", value=interaction.user.mention)
     await interaction.response.send_message(embed=embed)
@@ -708,12 +710,12 @@ async def cmd_warn(interaction: discord.Interaction, uzytkownik: discord.Member,
     async with aiosqlite.connect("moderation.db") as db:
         await db.execute(
             "INSERT INTO warnings (user_id, moderator_id, reason, timestamp) VALUES (?,?,?,?)",
-            (uzytkownik.id, interaction.user.id, powod, datetime.utcnow().isoformat()),
+            (uzytkownik.id, interaction.user.id, powod, datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
         cur = await db.execute("SELECT COUNT(*) FROM warnings WHERE user_id = ?", (uzytkownik.id,))
         count = (await cur.fetchone())[0]
-    embed = discord.Embed(title="⚠️ Ostrzeżenie", color=0xFFFF00, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="⚠️ Ostrzeżenie", color=0xFFFF00, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=f"{uzytkownik.mention} (`{uzytkownik.id}`)", inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     embed.add_field(name="Ilość warnów", value=str(count), inline=True)
@@ -735,7 +737,7 @@ async def cmd_warnings(interaction: discord.Interaction, uzytkownik: discord.Mem
         rows = await cur.fetchall()
     if not rows:
         return await interaction.response.send_message(f"{uzytkownik.mention} nie ma ostrzeżeń.", ephemeral=True)
-    embed = discord.Embed(title=f"Warny — {uzytkownik}", color=0xFFA500, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=f"Warny — {uzytkownik}", color=0xFFA500, timestamp=datetime.now(timezone.utc))
     for i, (reason, ts, mod) in enumerate(rows[:12], 1):
         embed.add_field(name=f"#{i} • <t:{int(datetime.fromisoformat(ts).timestamp())}:R>", value=f"{reason}\nMod: <@{mod}>", inline=False)
     embed.set_footer(text=f"Łącznie: {len(rows)}")
@@ -749,7 +751,7 @@ async def cmd_clearwarns(interaction: discord.Interaction, uzytkownik: discord.M
     async with aiosqlite.connect("moderation.db") as db:
         await db.execute("DELETE FROM warnings WHERE user_id = ?", (uzytkownik.id,))
         await db.commit()
-    embed = discord.Embed(title="🧹 Warny wyczyszczone", color=0x00FF00, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🧹 Warny wyczyszczone", color=0x00FF00, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
@@ -763,7 +765,7 @@ async def cmd_warn_remove(interaction: discord.Interaction, uzytkownik: discord.
     async with aiosqlite.connect("moderation.db") as db:
         await db.execute("DELETE FROM warnings WHERE user_id = ?", (uzytkownik.id,))
         await db.commit()
-    embed = discord.Embed(title="🧹 Warny usunięte", color=0x00FF00, timestamp=datetime.utcnow())
+    embed = discord.Embed(title="🧹 Warny usunięte", color=0x00FF00, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Użytkownik", value=uzytkownik.mention, inline=False)
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
@@ -846,7 +848,7 @@ async def cmd_setnick(interaction: discord.Interaction, uzytkownik: discord.Memb
 @app_commands.describe(uzytkownik="Kogo")
 async def cmd_userinfo(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
     user = uzytkownik or interaction.user
-    embed = discord.Embed(title=f"Informacje — {user}", color=user.color or 0x5865F2, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=f"Informacje — {user}", color=user.color or 0x5865F2, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="ID", value=str(user.id), inline=True)
     embed.add_field(name="Nick", value=user.display_name, inline=True)
@@ -861,7 +863,7 @@ async def cmd_userinfo(interaction: discord.Interaction, uzytkownik: Optional[di
 @app_commands.describe(uzytkownik="Kogo")
 async def cmd_user(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
     user = uzytkownik or interaction.user
-    embed = discord.Embed(title=f"Informacje — {user}", color=user.color or 0x5865F2, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=f"Informacje — {user}", color=user.color or 0x5865F2, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="ID", value=str(user.id), inline=True)
     embed.add_field(name="Nick", value=user.display_name, inline=True)
@@ -875,7 +877,7 @@ async def cmd_user(interaction: discord.Interaction, uzytkownik: Optional[discor
 @bot.tree.command(name="serverinfo", description="Info o serwerze")
 async def cmd_serverinfo(interaction: discord.Interaction):
     g = interaction.guild
-    embed = discord.Embed(title=g.name, color=0x5865F2, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=g.name, color=0x5865F2, timestamp=datetime.now(timezone.utc))
     if g.icon:
         embed.set_thumbnail(url=g.icon.url)
     embed.add_field(name="Właściciel", value=g.owner.mention if g.owner else "?", inline=True)
@@ -890,7 +892,7 @@ async def cmd_serverinfo(interaction: discord.Interaction):
 @bot.tree.command(name="server", description="Info o serwerze")
 async def cmd_server(interaction: discord.Interaction):
     g = interaction.guild
-    embed = discord.Embed(title=g.name, color=0x5865F2, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=g.name, color=0x5865F2, timestamp=datetime.now(timezone.utc))
     if g.icon:
         embed.set_thumbnail(url=g.icon.url)
     embed.add_field(name="Właściciel", value=g.owner.mention if g.owner else "?", inline=True)
@@ -955,7 +957,7 @@ async def cmd_invites(interaction: discord.Interaction, uzytkownik: Optional[dis
             (target.id,),
         )
         rows = await cur.fetchall()
-    embed = discord.Embed(title=f"📨 Zaproszenia — {target}", color=0x5865F2, timestamp=datetime.utcnow())
+    embed = discord.Embed(title=f"📨 Zaproszenia — {target}", color=0x5865F2, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="Łącznie", value=str(len(rows)), inline=False)
     if rows:
@@ -1039,7 +1041,7 @@ async def cmd_credits(interaction: discord.Interaction, uzytkownik: Optional[dis
 @bot.tree.command(name="daily", description="Odbierz codzienną nagrodę")
 async def cmd_daily(interaction: discord.Interaction):
     creds, last_daily, *_ = await get_economy(interaction.user.id)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if last_daily:
         last = datetime.fromisoformat(last_daily)
         if (now - last).total_seconds() < 86400:
@@ -1058,7 +1060,7 @@ async def cmd_rep(interaction: discord.Interaction, uzytkownik: discord.Member):
     if uzytkownik.id == interaction.user.id:
         return await interaction.response.send_message("❌ Nie możesz dać rep sobie.", ephemeral=True)
     _, _, _, last_rep, *_ = await get_economy(interaction.user.id)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if last_rep:
         last = datetime.fromisoformat(last_rep)
         if (now - last).total_seconds() < 86400:
