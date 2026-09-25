@@ -202,65 +202,55 @@ async def create_welcome_card(member: discord.Member) -> discord.File:
         async with session.get(str(member.display_avatar.replace(size=256))) as resp:
             avatar_data = await resp.read()
 
-    W, H = 720, 200
-    card = Image.new("RGBA", (W, H), (16, 16, 20, 255))
+    W, H = 950, 300
+    card = Image.new("RGBA", (W, H), (12, 12, 16, 255))
     draw = ImageDraw.Draw(card)
 
-    # Tło w stylu ProBot – ciemne + geometryczne kształty
-    # bazowy gradient
+    # Tło – ciemne z geometrycznymi kształtami (styl ProBot)
     for y in range(H):
-        c = 16 + int(6 * (y / H))
-        draw.line([(0, y), (W, y)], fill=(c, c, c + 3, 255))
+        shade = 12 + int(10 * (y / H))
+        draw.line([(0, y), (W, y)], fill=(shade, shade, shade + 6, 255))
 
-    # duże rozmyte trójkąty / bloby (jak tło ProBota)
+    # Duże trójkąty / kształty w tle (jak u ProBota)
     shapes = [
-        # lewy górny
-        [(0, 0), (180, 0), (90, 140)],
-        # prawy górny
-        [(W - 220, 0), (W, 0), (W, 160), (W - 100, 80)],
-        # dolny środek
-        [(200, H), (420, H), (350, 80)],
-        # prawy dół
-        [(W - 180, H), (W, H), (W, 100)],
+        [(550, -30), (900, 80), (700, 200)],
+        [(400, 180), (750, 100), (850, 300)],
+        [(-50, 50), (200, -20), (150, 250)],
+        [(200, 200), (450, 150), (500, 320)],
     ]
     for pts in shapes:
-        draw.polygon(pts, fill=(28, 28, 36, 90))
-
-    # dodatkowe elipsy
-    draw.ellipse([-40, -60, 160, 140], fill=(35, 35, 48, 70))
-    draw.ellipse([W - 200, 40, W + 40, H + 40], fill=(32, 32, 42, 80))
-    draw.ellipse([300, -50, 520, 100], fill=(25, 25, 35, 60))
+        draw.polygon(pts, fill=(28, 28, 38, 90))
 
     # Avatar – zaokrąglony kwadrat
-    avatar_size = 120
+    avatar_size = 160
     avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((avatar_size, avatar_size))
     mask = Image.new("L", (avatar_size, avatar_size), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, avatar_size - 1, avatar_size - 1], radius=16, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, avatar_size - 1, avatar_size - 1], radius=22, fill=255)
 
-    # cień
-    shadow = Image.new("RGBA", (avatar_size + 6, avatar_size + 6), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle([3, 3, avatar_size + 2, avatar_size + 2], radius=16, fill=(0, 0, 0, 120))
-    ax, ay = 28, (H - avatar_size) // 2
-    card.paste(shadow, (ax + 2, ay + 3), shadow)
+    # Cień
+    shadow = Image.new("RGBA", (avatar_size + 12, avatar_size + 12), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle([6, 6, avatar_size + 5, avatar_size + 5], radius=22, fill=(0, 0, 0, 120))
+    ax, ay = 40, (H - avatar_size) // 2
+    card.paste(shadow, (ax - 2, ay + 4), shadow)
     card.paste(avatar, (ax, ay), mask)
 
-    # Ciemny box tekstowy
-    bx1, by1 = 175, 35
-    bx2, by2 = W - 30, H - 35
-    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=12, fill=(26, 26, 32, 235))
-    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=12, outline=(50, 50, 60, 180), width=1)
+    # Box tekstowy
+    bx1, by1 = 240, 45
+    bx2, by2 = W - 40, H - 45
+    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=18, fill=(28, 28, 36, 235))
+    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=18, outline=(60, 60, 75, 200), width=2)
 
-    # Fonty – DUŻE i pogrubione
+    # DUŻE fonty
     try:
-        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 44)
-        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
+        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
     except Exception:
         font_name = ImageFont.load_default()
         font_sub = ImageFont.load_default()
 
     name = str(member.display_name)[:18]
-    draw.text((bx1 + 24, by1 + 22), name, font=font_name, fill=(255, 255, 255, 255))
-    draw.text((bx1 + 24, by1 + 80), "Witaj na serwerze!", font=font_sub, fill=(150, 160, 255, 255))
+    draw.text((bx1 + 36, by1 + 28), name, font=font_name, fill=(255, 255, 255, 255))
+    draw.text((bx1 + 36, by1 + 120), "Witaj na serwerze!", font=font_sub, fill=(150, 165, 255, 255))
 
     buffer = io.BytesIO()
     card.save(buffer, format="PNG")
