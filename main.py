@@ -196,23 +196,82 @@ async def update_invite_cache(guild):
 
 
 async def create_welcome_card(member: discord.Member) -> discord.File:
+    # Pobierz avatar
     async with aiohttp.ClientSession() as session:
-        async with session.get(str(member.display_avatar.replace(size=128))) as resp:
+        async with session.get(str(member.display_avatar.replace(size=256))) as resp:
             avatar_data = await resp.read()
-    avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((120, 120))
-    card = Image.new("RGBA", (500, 180), (25, 25, 30, 255))
+
+    # Wymiary karty (styl ProBot)
+    W, H = 700, 220
+    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(card)
-    mask = Image.new("L", (120, 120), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, 120, 120), fill=255)
-    card.paste(avatar, (30, 30), mask)
+
+    # Tło – ciemny gradient / solid
+    bg_color = (22, 22, 28, 255)
+    draw.rounded_rectangle([(0, 0), (W - 1, H - 1)], radius=20, fill=bg_color)
+
+    # Subtelna ramka
+    draw.rounded_rectangle([(0, 0), (W - 1, H - 1)], radius=20, outline=(55, 55, 70, 255), width=2)
+
+    # Panel tekstowy (jak u ProBota – ciemniejszy box)
+    panel_x1, panel_y1 = 200, 40
+    panel_x2, panel_y2 = W - 40, H - 40
+    draw.rounded_rectangle(
+        [(panel_x1, panel_y1), (panel_x2, panel_y2)],
+        radius=16,
+        fill=(32, 32, 40, 240),
+    )
+    draw.rounded_rectangle(
+        [(panel_x1, panel_y1), (panel_x2, panel_y2)],
+        radius=16,
+        outline=(70, 70, 90, 180),
+        width=1,
+    )
+
+    # Avatar – okrągły z obramowaniem
+    avatar_size = 140
+    avatar = Image.open(io.BytesIO(avatar_data)).convert("RGBA").resize((avatar_size, avatar_size))
+    mask = Image.new("L", (avatar_size, avatar_size), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+
+    # Obramowanie avatara (akcent)
+    ring = Image.new("RGBA", (avatar_size + 10, avatar_size + 10), (0, 0, 0, 0))
+    ring_draw = ImageDraw.Draw(ring)
+    ring_draw.ellipse((0, 0, avatar_size + 9, avatar_size + 9), fill=(88, 101, 242, 255))  # Discord blurple
+    ring_draw.ellipse((4, 4, avatar_size + 5, avatar_size + 5), fill=(22, 22, 28, 255))
+    card.paste(ring, (25, (H - avatar_size - 10) // 2), ring)
+
+    avatar_pos = (30, (H - avatar_size) // 2)
+    card.paste(avatar, avatar_pos, mask)
+
+    # Fonty
     try:
-        font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26)
+        font_name = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+        font_welcome = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
     except Exception:
-        font_big = ImageFont.load_default()
+        font_name = ImageFont.load_default()
+        font_welcome = ImageFont.load_default()
         font_small = ImageFont.load_default()
-    draw.text((170, 40), "Siema", font=font_big, fill=(255, 255, 255))
-    draw.text((170, 100), str(member.display_name)[:20], font=font_small, fill=(160, 160, 255))
+
+    # Teksty (polski, pogrubione)
+    name = str(member.display_name)[:22]
+    # Nazwa użytkownika
+    draw.text((panel_x1 + 28, panel_y1 + 28), name, font=font_name, fill=(255, 255, 255, 255))
+    # Witaj na serwerze
+    draw.text((panel_x1 + 28, panel_y1 + 80), "Witaj na serwerze!", font=font_welcome, fill=(160, 170, 255, 255))
+    # Liczba członków (opcjonalnie)
+    try:
+        member_count = member.guild.member_count if member.guild else 0
+        draw.text(
+            (panel_x1 + 28, panel_y1 + 120),
+            f"Jesteś #{member_count} członkiem",
+            font=font_small,
+            fill=(140, 140, 160, 255),
+        )
+    except Exception:
+        pass
+
     buffer = io.BytesIO()
     card.save(buffer, format="PNG")
     buffer.seek(0)
@@ -319,8 +378,7 @@ async def on_member_join(member: discord.Member):
         if channel:
             try:
                 file = await create_welcome_card(member)
-                await channel.send(file=file)
-                await channel.send(f"Witamy {member.mention} na **{SERVER_NAME}**")
+                await channel.send(content=f"👋 {member.mention}", file=file)
             except Exception as e:
                 print(f"Błąd powitania: {e}")
     if VERIFIED_ROLE_ID:
