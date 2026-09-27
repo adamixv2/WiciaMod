@@ -2216,8 +2216,43 @@ async def cmd_ticket_close(interaction: discord.Interaction):
 
 # ===================== GIVEAWAY / KONKURS =====================
 def parse_end_datetime(s: str) -> Optional[datetime]:
-    """Parsuje datę: '18:00 28.09.2026' lub '28.09.2026 18:00'."""
+    """Parsuje koniec konkursu.
+    - '17:05'           → dziś o 17:05
+    - '17:06 28.09'     → 28.09 (ten rok) o 17:06
+    - '18:00 28.09.2026'→ pełna data
+    """
     s = (s or "").strip()
+    tz = timezone(timedelta(hours=2))  # PL (CEST)
+    now = datetime.now(tz)
+
+    # sama godzina: 17:05 lub 9:30
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return now.replace(hour=h, minute=mi, second=0, microsecond=0)
+
+    # godzina + dzień.miesiąc (bez roku): 17:06 28.09
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s+(\d{1,2})[./](\d{1,2})", s)
+    if m:
+        h, mi, d, mo = map(int, m.groups())
+        if 0 <= h <= 23 and 0 <= mi <= 59 and 1 <= d <= 31 and 1 <= mo <= 12:
+            try:
+                return datetime(now.year, mo, d, h, mi, 0, tzinfo=tz)
+            except ValueError:
+                return None
+
+    # dzień.miesiąc + godzina: 28.09 17:06
+    m = re.fullmatch(r"(\d{1,2})[./](\d{1,2})\s+(\d{1,2}):(\d{2})", s)
+    if m:
+        d, mo, h, mi = map(int, m.groups())
+        if 0 <= h <= 23 and 0 <= mi <= 59 and 1 <= d <= 31 and 1 <= mo <= 12:
+            try:
+                return datetime(now.year, mo, d, h, mi, 0, tzinfo=tz)
+            except ValueError:
+                return None
+
+    # pełne formaty z rokiem
     formats = [
         "%H:%M %d.%m.%Y",
         "%d.%m.%Y %H:%M",
@@ -2230,8 +2265,7 @@ def parse_end_datetime(s: str) -> Optional[datetime]:
     for fmt in formats:
         try:
             dt = datetime.strptime(s, fmt)
-            dt = dt.replace(tzinfo=timezone(timedelta(hours=2)))
-            return dt
+            return dt.replace(tzinfo=tz)
         except ValueError:
             continue
     return None
@@ -2291,6 +2325,7 @@ async def _build_giveaway_embed(
 
 
 async def _end_giveaway(gid: int):
+    """Losuje zwycięzców (wywoływane dopiero ~30s po oficjalnym końcu)."""
     async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT channel_id, message_id, prize, winners_count, end_at, host_id, ended FROM giveaways WHERE id = ?",
@@ -2371,18 +2406,20 @@ async def giveaway_watcher():
             async with aiosqlite.connect("moderation.db") as db:
                 cur = await db.execute("SELECT id, end_at FROM giveaways WHERE ended = 0")
                 rows = await cur.fetchall()
+            now = datetime.now(timezone.utc)
             for gid, end_at in rows:
                 try:
                     end_dt = datetime.fromisoformat(end_at)
                     if end_dt.tzinfo is None:
                         end_dt = end_dt.replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) >= end_dt:
+                    # Od razu po czasie końca → losowanie + rola + wiadomość
+                    if now >= end_dt:
                         await _end_giveaway(gid)
                 except Exception as e:
                     print(f"Giveaway end error {gid}: {e}")
         except Exception as e:
             print(f"Giveaway watcher: {e}")
-        await asyncio.sleep(20)
+        await asyncio.sleep(5)  # sprawdzaj co 5s — prawie od razu po końcu
 
 
 class GiveawayJoinButton(discord.ui.Button):
@@ -2406,6 +2443,16 @@ class GiveawayJoinButton(discord.ui.Button):
         gid, ended, prize, winners_count, end_at, host_id = row
         if ended:
             return await interaction.response.send_message("❌ Konkurs już zakończony.", ephemeral=True)
+        try:
+            end_dt = datetime.fromisoformat(end_at)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= end_dt:
+                return await interaction.response.send_message(
+                    "❌ Konkurs już się zakończył — losowanie za chwilę.", ephemeral=True
+                )
+        except Exception:
+            pass
 
         async with aiosqlite.connect("moderation.db") as db:
             cur = await db.execute(
@@ -2449,7 +2496,7 @@ class GiveawayView(discord.ui.View):
 @bot.tree.command(name="giveaway", description="Utwórz konkurs (giveaway)")
 @app_commands.describe(
     nagroda="Co można wygrać (np. WiciaClient 30 dni)",
-    koniec="Data końca np. 18:00 28.09.2026",
+    koniec="Koniec: 17:05 (dziś) albo 17:06 28.09",
     wygrani="Ilu zwycięzców (domyślnie 1)",
     kanal="Kanał z konkursem (domyślnie ten)",
 )
@@ -2464,7 +2511,7 @@ async def cmd_giveaway(
     end_dt = parse_end_datetime(koniec)
     if not end_dt:
         return await interaction.response.send_message(
-            "❌ Zła data. Przykłady: `18:00 28.09.2026` albo `28.09.2026 18:00`",
+            "❌ Zła data. Przykłady: `17:05` (dziś) · `17:06 28.09` (dzień.miesiąc) · `18:00 28.09.2026`",
             ephemeral=True,
         )
     if end_dt <= datetime.now(timezone(timedelta(hours=2))):
