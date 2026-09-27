@@ -1536,6 +1536,23 @@ async def _collect_ticket_messages(channel: discord.TextChannel):
     return messages
 
 
+async def _human_messages_only(messages):
+    """Tylko wiadomości od ludzi (bez botów), z treścią."""
+    out = []
+    for msg in messages:
+        if msg.author.bot:
+            continue
+        content = (msg.content or "").strip()
+        if not content and not msg.attachments:
+            continue
+        line = content if content else ""
+        if msg.attachments:
+            atts = ", ".join(a.filename for a in msg.attachments)
+            line = (line + f" [pliki: {atts}]").strip()
+        out.append({"author": str(msg.author.display_name), "content": line})
+    return out
+
+
 async def _build_transcript_txt(
     messages,
     *,
@@ -1547,45 +1564,29 @@ async def _build_transcript_txt(
     claimed_by: int,
     created_at: str,
 ) -> bytes:
-    """Czytelny plik .txt — widać od razu w Discordzie i po pobraniu."""
+    """Czytelny TXT — tylko ludzie, bez dat i bez wiadomości bota."""
     cat_label = category
     for c in TICKET_CATEGORIES:
         if c["value"] == category:
             cat_label = c["label"]
             break
-    claimed_str = f"{claimed_by}" if claimed_by else "Not claimed"
+    humans = await _human_messages_only(messages)
     lines = [
-        f"========== TICKET #{ticket_number} ==========",
+        f"=== Przebieg rozmowy ===",
         f"Serwer: {SERVER_NAME}",
         f"Kategoria: {cat_label}",
-        f"Otwarty przez: {opener_id}",
-        f"Zamknięty przez: {closer} ({closer.id})",
-        f"Claim: {claimed_str}",
-        f"Otwarto: {created_at}",
-        f"Zamknięto: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
-        f"Powód: {reason or 'Brak'}",
-        "=" * 40,
+        f"Powod zamkniecia: {reason or 'Brak'}",
+        f"Zamkniety przez: {closer}",
+        "-" * 32,
         "",
     ]
-    for msg in messages:
-        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S") if msg.created_at else "?"
-        bot = " [BOT]" if msg.author.bot else ""
-        lines.append(f"[{ts}] {msg.author}{bot}:")
-        if msg.content:
-            lines.append(msg.content)
-        else:
-            lines.append("(brak tekstu)")
-        if msg.attachments:
-            lines.append("  Zalaczniki: " + ", ".join(a.filename for a in msg.attachments))
-        if msg.embeds:
-            for emb in msg.embeds:
-                if emb.title:
-                    lines.append(f"  [embed] {emb.title}")
-                if emb.description:
-                    lines.append(f"  {emb.description[:300]}")
-        lines.append("")
-    if len(messages) == 0:
-        lines.append("(brak wiadomosci)")
+    if not humans:
+        lines.append("(brak wiadomosci od uzytkownikow)")
+    else:
+        for h in humans:
+            lines.append(f"{h['author']}:")
+            lines.append(f"  {h['content']}")
+            lines.append("")
     return "\n".join(lines).encode("utf-8")
 
 
@@ -1600,7 +1601,7 @@ async def _build_transcript_html(
     claimed_by: int,
     created_at: str,
 ) -> bytes:
-    """HTML do pobrania i otwarcia w przeglądarce (nie do podglądu w Discordzie)."""
+    """HTML — tylko ludzie, kolory, bez dat."""
     def esc(s: str) -> str:
         return (
             str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
@@ -1612,53 +1613,37 @@ async def _build_transcript_html(
             cat_label = c["label"]
             break
 
+    humans = await _human_messages_only(messages)
+    colors = ["#57F287", "#5865F2", "#FEE75C", "#EB459E", "#ED4245", "#00D4FF"]
     rows = []
-    for msg in messages:
-        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S") if msg.created_at else "?"
-        author = esc(f"{msg.author}")
-        content = esc(msg.content) if msg.content else "<i>(brak tekstu)</i>"
-        if msg.attachments:
-            content += "<br><small>📎 " + esc(", ".join(a.filename for a in msg.attachments)) + "</small>"
-        if msg.embeds:
-            for emb in msg.embeds:
-                if emb.title:
-                    content += f"<br><b>{esc(emb.title)}</b>"
-                if emb.description:
-                    content += f"<br>{esc(emb.description[:400])}"
-        bot_tag = ' <span class="bot">BOT</span>' if msg.author.bot else ""
+    for i, h in enumerate(humans):
+        col = colors[i % len(colors)]
         rows.append(
-            f'<div class="msg"><div class="meta"><b>{author}</b>{bot_tag} · {ts}</div>'
-            f'<div class="body">{content}</div></div>'
+            f'<div class="msg" style="border-left:4px solid {col}">'
+            f'<div class="name" style="color:{col}">{esc(h["author"])}</div>'
+            f'<div class="body">{esc(h["content"])}</div></div>'
         )
 
-    claimed_str = f"{claimed_by}" if claimed_by else "Not claimed"
     html = f"""<!DOCTYPE html>
 <html lang="pl"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Ticket #{ticket_number}</title>
+<title>Przebieg rozmowy</title>
 <style>
 body{{margin:0;font-family:system-ui,sans-serif;background:#1e1f22;color:#dbdee1}}
-.wrap{{max-width:820px;margin:0 auto;padding:24px}}
-h1{{font-size:1.4rem}}
-.sub{{color:#949ba4;margin-bottom:16px}}
-.info{{background:#2b2d31;border-radius:8px;padding:14px;margin-bottom:16px;line-height:1.6}}
-.msg{{background:#2b2d31;border-radius:8px;padding:12px;margin-bottom:10px}}
-.meta{{color:#949ba4;font-size:.85rem;margin-bottom:6px}}
-.body{{white-space:pre-wrap;word-break:break-word}}
-.bot{{background:#5865f2;color:#fff;font-size:.7rem;padding:1px 5px;border-radius:3px}}
+.wrap{{max-width:720px;margin:0 auto;padding:24px}}
+h1{{font-size:1.3rem;color:#fff}}
+.info{{background:#2b2d31;border-radius:8px;padding:12px 14px;margin-bottom:16px;color:#b5bac1}}
+.msg{{background:#2b2d31;border-radius:8px;padding:12px 14px;margin-bottom:10px}}
+.name{{font-weight:700;margin-bottom:4px}}
+.body{{white-space:pre-wrap;word-break:break-word;line-height:1.45}}
 </style></head><body><div class="wrap">
-<h1>Ticket #{ticket_number}</h1>
-<div class="sub">{esc(SERVER_NAME)} — przebieg rozmowy</div>
+<h1>Przebieg rozmowy</h1>
 <div class="info">
-<b>Kategoria:</b> {esc(cat_label)}<br>
-<b>Otwarty przez:</b> {opener_id}<br>
-<b>Zamknięty przez:</b> {esc(str(closer))}<br>
-<b>Claim:</b> {esc(claimed_str)}<br>
-<b>Otwarto:</b> {esc(created_at)}<br>
-<b>Zamknięto:</b> {esc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))}<br>
-<b>Powód:</b> {esc(reason or "Brak")}
+Kategoria: <b>{esc(cat_label)}</b><br>
+Powód zamknięcia: <b>{esc(reason or "Brak")}</b><br>
+Zamknięty przez: <b>{esc(str(closer))}</b>
 </div>
-{"".join(rows) if rows else "<p>Brak wiadomości.</p>"}
+{"".join(rows) if rows else "<p>Brak wiadomości od użytkowników.</p>"}
 </div></body></html>"""
     return html.encode("utf-8")
 
@@ -1838,13 +1823,48 @@ async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
         return await interaction.response.send_message(
             "❌ Przebieg niedostępny (wygasł lub usunięty).", ephemeral=True
         )
-    data = row[0].encode("utf-8")
-    if len(data) > 7_500_000:
-        data = data[:7_500_000]
-    f = discord.File(io.BytesIO(data), filename=f"przebieg-ticket-{tnum}.txt")
+    raw = row[0]
+    embeds = []
+    colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245, 0x00D4FF]
+    blocks = []
+    current_author = None
+    current_lines = []
+    skip_prefixes = ("===", "---", "Serwer:", "Kategoria:", "Powod", "Zamkniety", "Powód")
+    for line in raw.splitlines():
+        if any(line.startswith(p) for p in skip_prefixes) or not line.strip():
+            if line.startswith("  ") and current_author is not None:
+                current_lines.append(line.strip())
+            continue
+        if line.endswith(":") and not line.startswith(" "):
+            if current_author and current_lines:
+                blocks.append((current_author, "\n".join(current_lines)))
+            current_author = line[:-1].strip()
+            current_lines = []
+        elif line.startswith("  ") and current_author is not None:
+            current_lines.append(line.strip())
+        elif current_author is not None and line.strip():
+            current_lines.append(line.strip())
+    if current_author and current_lines:
+        blocks.append((current_author, "\n".join(current_lines)))
+
+    if not blocks:
+        embed = discord.Embed(
+            title="📄 Przebieg rozmowy",
+            description=(raw[:4000] if raw else "Brak wiadomości."),
+            color=0x5865F2,
+        )
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    for i, (author, content) in enumerate(blocks[:20]):
+        emb = discord.Embed(
+            description=f"**{author}**\n{content[:1000]}",
+            color=colors[i % len(colors)],
+        )
+        embeds.append(emb)
+
     await interaction.response.send_message(
-        f"📄 Przebieg ticketa **#{tnum}**:",
-        file=f,
+        content="📄 **Przebieg rozmowy** (tylko wiadomości użytkowników):",
+        embeds=embeds[:10],
         ephemeral=True,
     )
 
@@ -2144,7 +2164,7 @@ class TicketSelect(discord.ui.Select):
         )
 
         await interaction.followup.send(
-            f"✅ Utworzono ticket **#{tnum}**: {ticket_ch.mention}", ephemeral=True
+            f"✅ Utworzono ticket: {ticket_ch.mention}", ephemeral=True
         )
 
         try:
