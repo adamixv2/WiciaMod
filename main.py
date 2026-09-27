@@ -21,6 +21,7 @@ GOODBYE_CHANNEL_ID = int(os.getenv("GOODBYE_CHANNEL_ID", "0"))
 VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0"))
 TEMP_HUB_CHANNEL_ID = int(os.getenv("TEMP_HUB_CHANNEL_ID", "0"))
 TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0"))
+INVITE_LOG_CHANNEL_ID = int(os.getenv("INVITE_LOG_CHANNEL_ID", "0"))
 
 SERVER_NAME = "WiciaClient20PLN"
 TEMP_ENABLED = True
@@ -106,6 +107,17 @@ async def init_db():
             user_id INTEGER, moderator_id INTEGER, reason TEXT, timestamp TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS invites (
             inviter_id INTEGER, invited_id INTEGER, code TEXT, timestamp TEXT)""")
+        # Usuń duplikaty (zostaw najnowszy wpis na invited_id) zanim założymy unique index
+        await db.execute("""
+            DELETE FROM invites WHERE rowid NOT IN (
+                SELECT MAX(rowid) FROM invites GROUP BY invited_id
+            )
+        """)
+        # Jedna osoba = jedno aktywne zaproszenie (przy ponownym wejściu nadpisujemy)
+        try:
+            await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_invited ON invites(invited_id)")
+        except Exception:
+            pass
         await db.execute("""CREATE TABLE IF NOT EXISTS economy (
             user_id INTEGER PRIMARY KEY,
             credits INTEGER DEFAULT 0,
@@ -120,6 +132,33 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS muted_text (
             user_id INTEGER PRIMARY KEY, until TEXT)""")
         await db.commit()
+
+
+async def get_active_invite_count(inviter_id: int) -> int:
+    """Liczba aktywnych zaproszeń (osoby nadal na serwerze są w bazie)."""
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM invites WHERE inviter_id = ?",
+            (inviter_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def remove_invite_for_member(member_id: int) -> Optional[int]:
+    """Usuwa zaproszenie przy wyjściu. Zwraca inviter_id albo None."""
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute(
+            "SELECT inviter_id FROM invites WHERE invited_id = ?",
+            (member_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        inviter_id = row[0]
+        await db.execute("DELETE FROM invites WHERE invited_id = ?", (member_id,))
+        await db.commit()
+        return inviter_id
 
 
 def is_mod():
@@ -353,20 +392,41 @@ async def on_member_join(member: discord.Member):
     guild = member.guild
     if guild.id not in invite_cache:
         await update_invite_cache(guild)
+    inviter = None
+    invite_code = None
     try:
         invites = await guild.invites()
         for inv in invites:
             if inv.uses > invite_cache[guild.id].get(inv.code, 0):
+                inviter = inv.inviter
+                invite_code = inv.code
+                inviter_id = inviter.id if inviter else 0
                 async with aiosqlite.connect("moderation.db") as db:
+                    # Usuń stare wpisy tej osoby (np. po rejoin) i wstaw aktualny
+                    await db.execute("DELETE FROM invites WHERE invited_id = ?", (member.id,))
                     await db.execute(
                         "INSERT INTO invites (inviter_id, invited_id, code, timestamp) VALUES (?,?,?,?)",
-                        (inv.inviter.id if inv.inviter else 0, member.id, inv.code, datetime.now(timezone.utc).isoformat()),
+                        (inviter_id, member.id, invite_code, datetime.now(timezone.utc).isoformat()),
                     )
                     await db.commit()
                 break
         await update_invite_cache(guild)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Błąd trackingu invite: {e}")
+
+    # Log na kanał zaproszeń (tylko aktywne)
+    if INVITE_LOG_CHANNEL_ID and inviter:
+        log_ch = bot.get_channel(INVITE_LOG_CHANNEL_ID)
+        if log_ch:
+            try:
+                count = await get_active_invite_count(inviter.id)
+                word = "zaproszenie" if count == 1 else ("zaproszenia" if 2 <= count % 10 <= 4 and not (12 <= count % 100 <= 14) else "zaproszeń")
+                await log_ch.send(
+                    f"**{member.mention}** został zaproszony przez **{inviter.mention}** i ma teraz **{count}** {word}."
+                )
+            except Exception as e:
+                print(f"Błąd logu invite: {e}")
+
     if WELCOME_CHANNEL_ID:
         channel = bot.get_channel(WELCOME_CHANNEL_ID)
         if channel:
@@ -387,6 +447,20 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    # Usuń aktywne zaproszenie — licznik invitera spada
+    inviter_id = await remove_invite_for_member(member.id)
+    if INVITE_LOG_CHANNEL_ID and inviter_id:
+        log_ch = bot.get_channel(INVITE_LOG_CHANNEL_ID)
+        if log_ch:
+            try:
+                count = await get_active_invite_count(inviter_id)
+                word = "zaproszenie" if count == 1 else ("zaproszenia" if 2 <= count % 10 <= 4 and not (12 <= count % 100 <= 14) else "zaproszeń")
+                await log_ch.send(
+                    f"**{member}** wyszedł z serwera. **<@{inviter_id}>** ma teraz **{count}** {word}."
+                )
+            except Exception:
+                pass
+
     if GOODBYE_CHANNEL_ID:
         channel = bot.get_channel(GOODBYE_CHANNEL_ID)
         if channel:
@@ -947,7 +1021,7 @@ async def cmd_invite(interaction: discord.Interaction):
     await interaction.response.send_message(f"🔗 Zaproś bota:\n{url}")
 
 
-@bot.tree.command(name="invites", description="Kto kogo zaprosił")
+@bot.tree.command(name="invites", description="Aktywne zaproszenia (osoby nadal na serwerze)")
 @app_commands.describe(uzytkownik="Opcjonalnie")
 async def cmd_invites(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
     target = uzytkownik or interaction.user
@@ -957,14 +1031,31 @@ async def cmd_invites(interaction: discord.Interaction, uzytkownik: Optional[dis
             (target.id,),
         )
         rows = await cur.fetchall()
-    embed = discord.Embed(title=f"📨 Zaproszenia — {target}", color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    # Extra safety: tylko osoby, które faktycznie są na serwerze
+    active = []
+    for invited_id, code, ts in rows:
+        if interaction.guild.get_member(invited_id):
+            active.append((invited_id, code, ts))
+        else:
+            # Sprzątanie śmieci (np. stary wpis sprzed update)
+            async with aiosqlite.connect("moderation.db") as db:
+                await db.execute("DELETE FROM invites WHERE invited_id = ?", (invited_id,))
+                await db.commit()
+    embed = discord.Embed(
+        title=f"📨 Aktywne zaproszenia — {target}",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+        description="Liczone są tylko osoby, które **nadal są** na serwerze.",
+    )
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="Łącznie", value=str(len(rows)), inline=False)
-    if rows:
-        tekst = "\n".join([f"• <@{i}> (`{i}`) — `{c}` • <t:{int(datetime.fromisoformat(t).timestamp())}:R>" for i, c, t in rows[:12]])
+    embed.add_field(name="Łącznie (aktywne)", value=str(len(active)), inline=False)
+    if active:
+        tekst = "\n".join(
+            [f"• <@{i}> (`{i}`) — `{c}` • <t:{int(datetime.fromisoformat(t).timestamp())}:R>" for i, c, t in active[:15]]
+        )
         embed.add_field(name="Ostatnie", value=tekst, inline=False)
     else:
-        embed.add_field(name="Ostatnie", value="Brak danych", inline=False)
+        embed.add_field(name="Ostatnie", value="Brak aktywnych zaproszeń", inline=False)
     await interaction.response.send_message(embed=embed)
 
 
