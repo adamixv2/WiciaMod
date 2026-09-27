@@ -2575,28 +2575,30 @@ async def cmd_giveaway_reroll(
 
 
 
-@bot.tree.command(name="sync", description="Odśwież / zsynchronizuj wszystkie komendy bota")
+@bot.tree.command(name="sync", description="Odśwież / zsynchronizuj wszystkie komendy bota (usuwa duplikaty)")
 @is_mod()
 async def cmd_sync(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
-        # Sync na ten serwer (od razu) + globalnie
+        # 1) Usuń komendy przypisane do serwera (to one robią DUPLIKATY obok globalnych)
+        cleared = 0
         if interaction.guild:
-            bot.tree.copy_global_to(guild=interaction.guild)
-            guild_synced = await bot.tree.sync(guild=interaction.guild)
-        else:
-            guild_synced = []
-        global_synced = await bot.tree.sync()
-        names = sorted({c.name for c in list(guild_synced) + list(global_synced)})
+            bot.tree.clear_commands(guild=interaction.guild)
+            await bot.tree.sync(guild=interaction.guild)
+            cleared = 1
+        # 2) Zostaw tylko globalne komendy (jedna lista, bez x2)
+        synced = await bot.tree.sync()
+        names = sorted(c.name for c in synced)
         lista = ", ".join(f"`/{n}`" for n in names[:40])
         more = f"\n... i {len(names) - 40} więcej" if len(names) > 40 else ""
         await interaction.followup.send(
-            f"✅ **Zsynchronizowano komendy**\n"
-            f"Serwer: **{len(guild_synced)}** · Globalnie: **{len(global_synced)}**\n\n"
-            f"{lista}{more}",
+            f"✅ **Zsynchronizowano komendy** (bez duplikatów)\n"
+            f"Usunięto kopie serwerowe · Globalnie: **{len(synced)}**\n\n"
+            f"{lista}{more}\n\n"
+            f"Odśwież Discord (Ctrl+R) jeśli nadal widzisz podwójne.",
             ephemeral=True,
         )
-        print(f"✅ /sync przez {interaction.user}: guild={len(guild_synced)} global={len(global_synced)}")
+        print(f"✅ /sync przez {interaction.user}: global={len(synced)} cleared_guild={cleared}")
     except Exception as e:
         await interaction.followup.send(f"❌ Błąd sync: `{e}`", ephemeral=True)
 
