@@ -1775,34 +1775,13 @@ async def _close_ticket(
             embed.add_field(name="Reason", value=reason or "No reason provided", inline=False)
             embed.set_footer(text=SERVER_NAME)
             try:
-                await arch.send(embed=embed)
+                # Przycisk jak na PV — przebieg dopiero po kliknięciu
+                await arch.send(
+                    embed=embed,
+                    view=TicketTranscriptView(ticket_number or channel.id),
+                )
             except Exception as e:
                 print(f"Błąd archiwum ticket: {e}")
-
-            # Kolorowy przebieg rozmowy (tylko użytkownicy)
-            colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245, 0x00D4FF]
-            chat_embeds = []
-            for i, h in enumerate(humans[:20]):
-                chat_embeds.append(
-                    discord.Embed(
-                        description=f"**{h['author']}**\n{h['content'][:1000]}",
-                        color=colors[i % len(colors)],
-                    )
-                )
-            if chat_embeds:
-                try:
-                    # Discord max 10 embeds na wiadomość
-                    for i in range(0, len(chat_embeds), 10):
-                        chunk = chat_embeds[i : i + 10]
-                        content = "📄 **Przebieg rozmowy**" if i == 0 else None
-                        await arch.send(content=content, embeds=chunk)
-                except Exception as e:
-                    print(f"Błąd przebiegu w archiwum: {e}")
-            else:
-                try:
-                    await arch.send("📄 Brak wiadomości od użytkowników w tym tickecie.")
-                except Exception:
-                    pass
 
     await asyncio.sleep(3)
     try:
@@ -1862,10 +1841,16 @@ async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
             )
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        for i, (author, content) in enumerate(blocks[:20]):
+        # Kolor stały per gracz w ramach ticketa; inny ticket = inna paleta
+        author_color = {}
+        for author, content in blocks[:20]:
+            if author not in author_color:
+                # hash(nick + nr ticketa) → inny kolor w każdym tickecie
+                h = sum(ord(c) for c in f"{author}:{tnum}")
+                author_color[author] = colors[h % len(colors)]
             emb = discord.Embed(
                 description=f"**{author}**\n{content[:1000]}",
-                color=colors[i % len(colors)],
+                color=author_color[author],
             )
             embeds.append(emb)
 
