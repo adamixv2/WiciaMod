@@ -1813,6 +1813,9 @@ async def _close_ticket(
 
 
 async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
+    # Unikaj podwójnej odpowiedzi (View + listen)
+    if interaction.response.is_done():
+        return
     async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT content_txt FROM ticket_transcripts WHERE ticket_number = ?",
@@ -1820,9 +1823,12 @@ async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
         )
         row = await cur.fetchone()
     if not row or not row[0]:
-        return await interaction.response.send_message(
-            "❌ Przebieg niedostępny (wygasł lub usunięty).", ephemeral=True
-        )
+        try:
+            return await interaction.response.send_message(
+                "❌ Przebieg niedostępny (wygasł lub usunięty).", ephemeral=True
+            )
+        except Exception:
+            return
     raw = row[0]
     embeds = []
     colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245, 0x00D4FF]
@@ -1847,30 +1853,34 @@ async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
     if current_author and current_lines:
         blocks.append((current_author, "\n".join(current_lines)))
 
-    if not blocks:
-        embed = discord.Embed(
-            title="📄 Przebieg rozmowy",
-            description=(raw[:4000] if raw else "Brak wiadomości."),
-            color=0x5865F2,
-        )
-        return await interaction.response.send_message(embed=embed, ephemeral=True)
+    try:
+        if not blocks:
+            embed = discord.Embed(
+                title="📄 Przebieg rozmowy",
+                description=(raw[:4000] if raw else "Brak wiadomości."),
+                color=0x5865F2,
+            )
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    for i, (author, content) in enumerate(blocks[:20]):
-        emb = discord.Embed(
-            description=f"**{author}**\n{content[:1000]}",
-            color=colors[i % len(colors)],
-        )
-        embeds.append(emb)
+        for i, (author, content) in enumerate(blocks[:20]):
+            emb = discord.Embed(
+                description=f"**{author}**\n{content[:1000]}",
+                color=colors[i % len(colors)],
+            )
+            embeds.append(emb)
 
-    await interaction.response.send_message(
-        content="📄 **Przebieg rozmowy** (tylko wiadomości użytkowników):",
-        embeds=embeds[:10],
-        ephemeral=True,
-    )
+        await interaction.response.send_message(
+            content="📄 **Przebieg rozmowy** (tylko wiadomości użytkowników):",
+            embeds=embeds[:10],
+            ephemeral=True,
+        )
+    except discord.HTTPException:
+        # Interaction already acknowledged — ignoruj
+        return
 
 
 class TicketTranscriptView(discord.ui.View):
-    """Przycisk w DM — działa od razu; po restarcie obsługuje on_interaction."""
+    """Przycisk w DM — obsługa tylko przez on_transcript_button (bez podwójnego ACK)."""
 
     def __init__(self, ticket_number: int = 0):
         super().__init__(timeout=None)
@@ -1882,17 +1892,11 @@ class TicketTranscriptView(discord.ui.View):
             custom_id=f"ticket_transcript:{ticket_number}",
         )
 
-        async def _cb(interaction: discord.Interaction):
-            tnum = ticket_number
-            cid = (interaction.data or {}).get("custom_id", "")
-            if cid.startswith("ticket_transcript:"):
-                try:
-                    tnum = int(cid.split(":")[1])
-                except Exception:
-                    pass
-            await _send_transcript_file(interaction, tnum)
+        async def _noop(interaction: discord.Interaction):
+            # Celowo puste — odpowiada listener on_transcript_button
+            return
 
-        btn.callback = _cb
+        btn.callback = _noop
         self.add_item(btn)
 
 
