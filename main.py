@@ -1679,16 +1679,7 @@ async def _close_ticket(
         claimed_by=claimed_by or 0,
         created_at=created_at or "?",
     )
-    html_bytes = await _build_transcript_html(
-        messages,
-        ticket_number=ticket_number or 0,
-        category=category,
-        opener_id=owner_id,
-        closer=closer,
-        reason=reason,
-        claimed_by=claimed_by or 0,
-        created_at=created_at or "?",
-    )
+    humans = await _human_messages_only(messages)
 
     async with aiosqlite.connect("moderation.db") as db:
         await db.execute(
@@ -1751,7 +1742,7 @@ async def _close_ticket(
     except Exception as e:
         print(f"Nie udało się wysłać DM o zamknięciu ticketa: {e}")
 
-    # Archiwum adminów: embed + czytelny TXT + HTML do pobrania
+    # Archiwum adminów: podsumowanie + kolorowy przebieg (jak na PV)
     if TICKET_ARCHIVE_CHANNEL_ID:
         arch = channel.guild.get_channel(TICKET_ARCHIVE_CHANNEL_ID)
         if arch:
@@ -1782,25 +1773,34 @@ async def _close_ticket(
             )
             embed.add_field(name="Duration", value=duration_str, inline=True)
             embed.add_field(name="Reason", value=reason or "No reason provided", inline=False)
-            embed.add_field(
-                name="📄 Przebieg",
-                value=(
-                    "• **`.txt`** — otwórz w Discordzie / Notatniku (czytelny tekst)\n"
-                    "• **`.html`** — **pobierz** i otwórz w przeglądarce (ładna strona)"
-                ),
-                inline=False,
-            )
             embed.set_footer(text=SERVER_NAME)
-            files = [
-                discord.File(io.BytesIO(txt_bytes), filename=f"transcript-ticket-{ticket_number or channel.id}.txt"),
-                discord.File(io.BytesIO(html_bytes), filename=f"transcript-ticket-{ticket_number or channel.id}.html"),
-            ]
             try:
-                await arch.send(embed=embed, files=files)
+                await arch.send(embed=embed)
             except Exception as e:
                 print(f"Błąd archiwum ticket: {e}")
+
+            # Kolorowy przebieg rozmowy (tylko użytkownicy)
+            colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245, 0x00D4FF]
+            chat_embeds = []
+            for i, h in enumerate(humans[:20]):
+                chat_embeds.append(
+                    discord.Embed(
+                        description=f"**{h['author']}**\n{h['content'][:1000]}",
+                        color=colors[i % len(colors)],
+                    )
+                )
+            if chat_embeds:
                 try:
-                    await arch.send(embed=embed)
+                    # Discord max 10 embeds na wiadomość
+                    for i in range(0, len(chat_embeds), 10):
+                        chunk = chat_embeds[i : i + 10]
+                        content = "📄 **Przebieg rozmowy**" if i == 0 else None
+                        await arch.send(content=content, embeds=chunk)
+                except Exception as e:
+                    print(f"Błąd przebiegu w archiwum: {e}")
+            else:
+                try:
+                    await arch.send("📄 Brak wiadomości od użytkowników w tym tickecie.")
                 except Exception:
                     pass
 
