@@ -22,11 +22,21 @@ VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0"))
 TEMP_HUB_CHANNEL_ID = int(os.getenv("TEMP_HUB_CHANNEL_ID", "0"))
 TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0"))
 INVITE_LOG_CHANNEL_ID = int(os.getenv("INVITE_LOG_CHANNEL_ID", "0"))
+TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
+TICKET_STAFF_ROLE_ID = int(os.getenv("TICKET_STAFF_ROLE_ID", "0"))  # jeśli 0 → używa MOD_ROLE_ID
 
 SERVER_NAME = "WiciaClient20PLN"
 TEMP_ENABLED = True
 TEMP_MAX_CHANNELS = 3
 TEMP_DELETE_SECONDS = 30
+
+# Kategorie ticketów (label, value, emoji, opis w select)
+TICKET_CATEGORIES = [
+    {"label": "Zakup", "value": "zakup", "emoji": "🛒", "desc": "Chcę kupić produkt/usługę"},
+    {"label": "Pomoc", "value": "pomoc", "emoji": "🆘", "desc": "Potrzebuję pomocy technicznej"},
+    {"label": "Współpraca", "value": "wspolpraca", "emoji": "🤝", "desc": "Mam ofertę współpracy"},
+    {"label": "Inne", "value": "inne", "emoji": "❓", "desc": "Inny powód kontaktu"},
+]
 
 # ===================== BOT =====================
 intents = discord.Intents.default()
@@ -131,6 +141,17 @@ async def init_db():
             user_id INTEGER PRIMARY KEY, points INTEGER DEFAULT 0)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS muted_text (
             user_id INTEGER PRIMARY KEY, until TEXT)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS tickets (
+            channel_id INTEGER PRIMARY KEY,
+            user_id INTEGER,
+            category TEXT,
+            created_at TEXT,
+            closed INTEGER DEFAULT 0,
+            claimed_by INTEGER DEFAULT 0)""")
+        try:
+            await db.execute("ALTER TABLE tickets ADD COLUMN claimed_by INTEGER DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -367,6 +388,9 @@ async def on_ready():
     await init_db()
     for g in bot.guilds:
         await update_invite_cache(g)
+    # Persistent views (działają po restarcie bota)
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketControlView())
     try:
         synced = await bot.tree.sync()
         print(f"✅ Zalogowano: {bot.user}")
@@ -1012,6 +1036,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="Głos", value="`/moveme` `/move` `/moveall` `/vkick`", inline=False)
     embed.add_field(name="Inne", value="`/roll` `/short` `/rolegive` `/roleremove`", inline=False)
     embed.add_field(name="Temp VC", value="`/tempon` `/tempoff` `/tempmax` `/temptime`", inline=False)
+    embed.add_field(name="Tickety", value="`/ticket_setup` `/ticket_close`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1415,6 +1440,375 @@ async def cmd_temptime(interaction: discord.Interaction, sekundy: app_commands.R
     global TEMP_DELETE_SECONDS
     TEMP_DELETE_SECONDS = sekundy
     await interaction.response.send_message(f"✅ Czas usuwania pustego temp: **{sekundy}s**")
+
+
+# ===================== TICKETY =====================
+def _ticket_staff_role_id() -> int:
+    return TICKET_STAFF_ROLE_ID or MOD_ROLE_ID
+
+
+def _is_ticket_staff(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator or member.guild_permissions.manage_channels:
+        return True
+    if MOD_ROLE_ID and any(r.id == MOD_ROLE_ID for r in member.roles):
+        return True
+    rid = _ticket_staff_role_id()
+    if rid and any(r.id == rid for r in member.roles):
+        return True
+    return False
+
+
+async def _get_ticket(channel_id: int):
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute(
+            "SELECT user_id, category, closed, claimed_by FROM tickets WHERE channel_id = ?",
+            (channel_id,),
+        )
+        return await cur.fetchone()
+
+
+class TicketCloseReasonModal(discord.ui.Modal, title="Zamknij ticket z powodem"):
+    reason = discord.ui.TextInput(
+        label="Powód zamknięcia",
+        placeholder="Np. sprawa rozwiązana / spam / brak odpowiedzi...",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=True,
+    )
+
+    def __init__(self, channel: discord.TextChannel):
+        super().__init__()
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        row = await _get_ticket(self.channel.id)
+        if not row or row[2]:
+            return await interaction.response.send_message("❌ Ticket nieaktywny.", ephemeral=True)
+        owner_id = row[0]
+        if interaction.user.id != owner_id and not _is_ticket_staff(interaction.user):
+            return await interaction.response.send_message("❌ Brak uprawnień.", ephemeral=True)
+
+        reason = str(self.reason)
+        embed = discord.Embed(
+            title="🔒 Ticket zamknięty",
+            description=f"Zamknięty przez {interaction.user.mention}\n**Powód:** {reason}",
+            color=0xE74C3C,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.response.send_message(embed=embed)
+        async with aiosqlite.connect("moderation.db") as db:
+            await db.execute("UPDATE tickets SET closed = 1 WHERE channel_id = ?", (self.channel.id,))
+            await db.commit()
+        await asyncio.sleep(5)
+        try:
+            await self.channel.delete(reason=f"Ticket zamknięty: {reason} | {interaction.user}")
+        except Exception:
+            pass
+
+
+class TicketControlView(discord.ui.View):
+    """Przyciski w kanale ticketa: Close with Reason (gracz+admin), Claim/Unclaim (admin)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Close with Reason",
+        style=discord.ButtonStyle.primary,
+        emoji="📝",
+        custom_id="ticket_close_reason",
+    )
+    async def close_reason_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = await _get_ticket(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ To nie jest kanał ticketa.", ephemeral=True)
+        owner_id, _, closed, _ = row
+        if closed:
+            return await interaction.response.send_message("❌ Ticket już zamknięty.", ephemeral=True)
+        if interaction.user.id != owner_id and not _is_ticket_staff(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Tylko właściciel ticketa lub administracja może zamknąć.", ephemeral=True
+            )
+        await interaction.response.send_modal(TicketCloseReasonModal(interaction.channel))
+
+    @discord.ui.button(
+        label="Claim",
+        style=discord.ButtonStyle.success,
+        emoji="✋",
+        custom_id="ticket_claim",
+    )
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_ticket_staff(interaction.user):
+            return await interaction.response.send_message("❌ Tylko administracja może claimować.", ephemeral=True)
+        row = await _get_ticket(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ To nie jest kanał ticketa.", ephemeral=True)
+        owner_id, category, closed, claimed_by = row
+        if closed:
+            return await interaction.response.send_message("❌ Ticket zamknięty.", ephemeral=True)
+        if claimed_by and claimed_by != interaction.user.id:
+            return await interaction.response.send_message(
+                f"❌ Ticket już claimnięty przez <@{claimed_by}>. Użyj **Unclaim**.", ephemeral=True
+            )
+        if claimed_by == interaction.user.id:
+            return await interaction.response.send_message("✅ Już claimnąłeś ten ticket.", ephemeral=True)
+
+        async with aiosqlite.connect("moderation.db") as db:
+            await db.execute(
+                "UPDATE tickets SET claimed_by = ? WHERE channel_id = ?",
+                (interaction.user.id, interaction.channel.id),
+            )
+            await db.commit()
+
+        embed = discord.Embed(
+            title="✋ Ticket claimnięty",
+            description=f"{interaction.user.mention} przejął ten ticket.",
+            color=0x2ECC71,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.response.send_message(embed=embed)
+
+        # Zmień nazwę kanału (opcjonalnie)
+        try:
+            name = interaction.channel.name
+            if not name.startswith("claimed-"):
+                await interaction.channel.edit(name=f"claimed-{name.replace('ticket-', '')}")
+        except Exception:
+            pass
+
+    @discord.ui.button(
+        label="Unclaim",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔓",
+        custom_id="ticket_unclaim",
+    )
+    async def unclaim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_ticket_staff(interaction.user):
+            return await interaction.response.send_message("❌ Tylko administracja może unclaimować.", ephemeral=True)
+        row = await _get_ticket(interaction.channel.id)
+        if not row:
+            return await interaction.response.send_message("❌ To nie jest kanał ticketa.", ephemeral=True)
+        owner_id, category, closed, claimed_by = row
+        if closed:
+            return await interaction.response.send_message("❌ Ticket zamknięty.", ephemeral=True)
+        if not claimed_by:
+            return await interaction.response.send_message("❌ Ticket nie jest claimnięty.", ephemeral=True)
+        if claimed_by != interaction.user.id and not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                f"❌ Ticket claimnięty przez <@{claimed_by}>. Tylko ta osoba lub admin może unclaimować.",
+                ephemeral=True,
+            )
+
+        async with aiosqlite.connect("moderation.db") as db:
+            await db.execute(
+                "UPDATE tickets SET claimed_by = 0 WHERE channel_id = ?",
+                (interaction.channel.id,),
+            )
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🔓 Ticket unclaimnięty",
+            description=f"{interaction.user.mention} oddał ticket.",
+            color=0x95A5A6,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.response.send_message(embed=embed)
+
+        try:
+            name = interaction.channel.name
+            if name.startswith("claimed-"):
+                await interaction.channel.edit(name=name.replace("claimed-", "ticket-", 1))
+        except Exception:
+            pass
+
+
+class TicketSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label=c["label"],
+                value=c["value"],
+                emoji=c["emoji"],
+                description=c["desc"],
+            )
+            for c in TICKET_CATEGORIES
+        ]
+        super().__init__(
+            placeholder="Kliknij aby wybrać kategorię ticketa",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="ticket_category_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        category = self.values[0]
+        cat_info = next((c for c in TICKET_CATEGORIES if c["value"] == category), None)
+        cat_label = cat_info["label"] if cat_info else category
+        cat_emoji = cat_info["emoji"] if cat_info else "🎫"
+
+        # Max 1 otwarty ticket
+        async with aiosqlite.connect("moderation.db") as db:
+            cur = await db.execute(
+                "SELECT channel_id FROM tickets WHERE user_id = ? AND closed = 0",
+                (interaction.user.id,),
+            )
+            existing = await cur.fetchone()
+        if existing:
+            ch = interaction.guild.get_channel(existing[0])
+            if ch:
+                return await interaction.response.send_message(
+                    f"❌ Masz już otwarty ticket: {ch.mention}", ephemeral=True
+                )
+            async with aiosqlite.connect("moderation.db") as db:
+                await db.execute("UPDATE tickets SET closed = 1 WHERE channel_id = ?", (existing[0],))
+                await db.commit()
+
+        await interaction.response.defer(ephemeral=True)
+
+        staff_role_id = _ticket_staff_role_id()
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                attach_files=True,
+                embed_links=True,
+                read_message_history=True,
+            ),
+            interaction.guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_channels=True,
+                manage_messages=True,
+            ),
+        }
+        if staff_role_id:
+            role = interaction.guild.get_role(staff_role_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    attach_files=True,
+                    manage_messages=True,
+                    read_message_history=True,
+                )
+
+        category_obj = None
+        if TICKET_CATEGORY_ID:
+            category_obj = interaction.guild.get_channel(TICKET_CATEGORY_ID)
+            if not isinstance(category_obj, discord.CategoryChannel):
+                category_obj = None
+
+        safe_name = re.sub(r"[^a-zA-Z0-9\-]", "", interaction.user.name.lower())[:12] or "user"
+        channel_name = f"ticket-{cat_label.lower()}-{safe_name}"
+
+        try:
+            ticket_ch = await interaction.guild.create_text_channel(
+                name=channel_name[:90],
+                overwrites=overwrites,
+                category=category_obj,
+                topic=f"Ticket {cat_label} | {interaction.user} ({interaction.user.id})",
+                reason=f"Ticket: {cat_label} — {interaction.user}",
+            )
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Nie udało się utworzyć ticketa: `{e}`", ephemeral=True)
+
+        async with aiosqlite.connect("moderation.db") as db:
+            await db.execute(
+                "INSERT INTO tickets (channel_id, user_id, category, created_at, closed, claimed_by) VALUES (?,?,?,?,0,0)",
+                (ticket_ch.id, interaction.user.id, category, datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+
+        # Powitanie jak na screenie + ping
+        embed = discord.Embed(
+            title="🎫 Witaj w swoim tickecie!",
+            description=(
+                f"Witam {interaction.user.mention}, opisz dokładnie swój problem lub pytanie. "
+                f"Administracja odpowie najszybciej jak to możliwe!\n\n"
+                f"**Kategoria:** {cat_emoji} {cat_label}"
+            ),
+            color=0xF1C40F,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(
+            name="📌 Pamiętaj",
+            value=(
+                "► **Cierpliwość:** maksymalny czas odpowiedzi to **24 godziny**.\n"
+                "► **Nie oznaczaj** zarządu (Właścicieli/Developerów).\n"
+                "► Zamknij ticket przyciskiem **Close with Reason** gdy sprawa załatwiona."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"{SERVER_NAME} • Ticket system")
+
+        staff_ping = f"<@&{staff_role_id}>" if staff_role_id else ""
+        await ticket_ch.send(
+            content=f"{interaction.user.mention} {staff_ping}".strip(),
+            embed=embed,
+            view=TicketControlView(),
+        )
+
+        await interaction.followup.send(
+            f"✅ Utworzono ticket: {ticket_ch.mention}", ephemeral=True
+        )
+
+        # Reset select (placeholder znowu widoczny)
+        try:
+            if interaction.message:
+                await interaction.message.edit(view=TicketPanelView())
+        except Exception:
+            pass
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketSelect())
+
+
+@bot.tree.command(name="ticket_setup", description="Wyślij panel ticketów na ten kanał")
+@is_mod()
+async def cmd_ticket_setup(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="✉️ Kontakt z administracją",
+        description=(
+            "**Jeśli chcesz kupić WiciaClient, potrzebujesz pomocy technicznej lub masz ofertę współpracy — otwórz ticket.**\n\n"
+            "Wybierz kategorię z menu poniżej, aby otworzyć ticketa.\n\n"
+            "**Dostępne kategorie:**\n"
+            "🛒 **Zakup** — produkt / usługa\n"
+            "🆘 **Pomoc** — wsparcie techniczne\n"
+            "🤝 **Współpraca** — oferty partnerskie\n"
+            "❓ **Inne** — pozostałe sprawy"
+        ),
+        color=0x5865F2,
+    )
+    embed.add_field(
+        name="📌 Zasady",
+        value=(
+            "► **Cierpliwość:** odpowiadamy w ciągu **24 godzin**.\n"
+            "► **Nie oznaczaj** Właścicieli/Developerów.\n"
+            "► Jeden otwarty ticket na osobę."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Kliknij aby wybrać kategorię ticketa")
+    await interaction.channel.send(embed=embed, view=TicketPanelView())
+    await interaction.response.send_message("✅ Panel ticketów wysłany.", ephemeral=True)
+
+
+@bot.tree.command(name="ticket_close", description="Zamknij ticket (w kanale ticketa) — z powodem")
+async def cmd_ticket_close(interaction: discord.Interaction):
+    row = await _get_ticket(interaction.channel.id)
+    if not row:
+        return await interaction.response.send_message("❌ To nie jest kanał ticketa.", ephemeral=True)
+    owner_id, _, closed, _ = row
+    if closed:
+        return await interaction.response.send_message("❌ Ticket już zamknięty.", ephemeral=True)
+    if interaction.user.id != owner_id and not _is_ticket_staff(interaction.user):
+        return await interaction.response.send_message("❌ Brak uprawnień.", ephemeral=True)
+    await interaction.response.send_modal(TicketCloseReasonModal(interaction.channel))
 
 
 # ===================== START =====================
