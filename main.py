@@ -174,6 +174,11 @@ async def init_db():
             giveaway_id INTEGER,
             user_id INTEGER,
             PRIMARY KEY (giveaway_id, user_id))""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS ticket_transcripts (
+            ticket_number INTEGER PRIMARY KEY,
+            channel_id INTEGER,
+            content_txt TEXT,
+            created_at TEXT)""")
         await db.commit()
 
 
@@ -426,6 +431,23 @@ async def on_ready():
             print(f"   /{cmd.name}")
     except Exception as e:
         print(f"❌ Błąd sync: {e}")
+
+
+@bot.listen("on_interaction")
+async def on_transcript_button(interaction: discord.Interaction):
+    """Persistent przycisk transcript w DM (nie nadpisuje innych interakcji)."""
+    if interaction.type != discord.InteractionType.component:
+        return
+    cid = (interaction.data or {}).get("custom_id", "")
+    if not cid.startswith("ticket_transcript:"):
+        return
+    if interaction.response.is_done():
+        return
+    try:
+        tnum = int(cid.split(":")[1])
+    except Exception:
+        return
+    await _send_transcript_file(interaction, tnum)
 
 
 @bot.event
@@ -1504,8 +1526,18 @@ async def _next_ticket_number() -> int:
         return (row[0] or 0) + 1
 
 
-async def _build_transcript_html(
-    channel: discord.TextChannel,
+async def _collect_ticket_messages(channel: discord.TextChannel):
+    messages = []
+    try:
+        async for msg in channel.history(limit=500, oldest_first=True):
+            messages.append(msg)
+    except Exception:
+        pass
+    return messages
+
+
+async def _build_transcript_txt(
+    messages,
     *,
     ticket_number: int,
     category: str,
@@ -1515,37 +1547,63 @@ async def _build_transcript_html(
     claimed_by: int,
     created_at: str,
 ) -> bytes:
-    """MEGA SIMPLE HTML — otwiera się w przeglądarce po pobraniu pliku."""
-    messages = []
-    try:
-        async for msg in channel.history(limit=500, oldest_first=True):
-            messages.append(msg)
-    except Exception:
-        pass
-
-    def esc(s: str) -> str:
-        return (
-            str(s)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
-
-    rows = []
+    """Czytelny plik .txt — widać od razu w Discordzie i po pobraniu."""
+    cat_label = category
+    for c in TICKET_CATEGORIES:
+        if c["value"] == category:
+            cat_label = c["label"]
+            break
+    claimed_str = f"{claimed_by}" if claimed_by else "Not claimed"
+    lines = [
+        f"========== TICKET #{ticket_number} ==========",
+        f"Serwer: {SERVER_NAME}",
+        f"Kategoria: {cat_label}",
+        f"Otwarty przez: {opener_id}",
+        f"Zamknięty przez: {closer} ({closer.id})",
+        f"Claim: {claimed_str}",
+        f"Otwarto: {created_at}",
+        f"Zamknięto: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"Powód: {reason or 'Brak'}",
+        "=" * 40,
+        "",
+    ]
     for msg in messages:
         ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S") if msg.created_at else "?"
-        author = esc(f"{msg.author} ({msg.author.id})")
-        content = esc(msg.content) if msg.content else "<i>(brak tekstu)</i>"
+        bot = " [BOT]" if msg.author.bot else ""
+        lines.append(f"[{ts}] {msg.author}{bot}:")
+        if msg.content:
+            lines.append(msg.content)
+        else:
+            lines.append("(brak tekstu)")
         if msg.attachments:
-            atts = ", ".join(esc(a.filename) for a in msg.attachments)
-            content += f"<br><small>📎 {atts}</small>"
+            lines.append("  Zalaczniki: " + ", ".join(a.filename for a in msg.attachments))
         if msg.embeds:
-            content += f"<br><small>📋 embed x{len(msg.embeds)}</small>"
-        bot_tag = ' <span class="bot">BOT</span>' if msg.author.bot else ""
-        rows.append(
-            f'<div class="msg"><div class="meta"><b>{author}</b>{bot_tag} · {ts}</div>'
-            f'<div class="body">{content}</div></div>'
+            for emb in msg.embeds:
+                if emb.title:
+                    lines.append(f"  [embed] {emb.title}")
+                if emb.description:
+                    lines.append(f"  {emb.description[:300]}")
+        lines.append("")
+    if len(messages) == 0:
+        lines.append("(brak wiadomosci)")
+    return "\n".join(lines).encode("utf-8")
+
+
+async def _build_transcript_html(
+    messages,
+    *,
+    ticket_number: int,
+    category: str,
+    opener_id: int,
+    closer: discord.Member,
+    reason: str,
+    claimed_by: int,
+    created_at: str,
+) -> bytes:
+    """HTML do pobrania i otwarcia w przeglądarce (nie do podglądu w Discordzie)."""
+    def esc(s: str) -> str:
+        return (
+            str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
         )
 
     cat_label = category
@@ -1554,43 +1612,54 @@ async def _build_transcript_html(
             cat_label = c["label"]
             break
 
-    claimed_str = f"<@{claimed_by}>" if claimed_by else "Not claimed"
+    rows = []
+    for msg in messages:
+        ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S") if msg.created_at else "?"
+        author = esc(f"{msg.author}")
+        content = esc(msg.content) if msg.content else "<i>(brak tekstu)</i>"
+        if msg.attachments:
+            content += "<br><small>📎 " + esc(", ".join(a.filename for a in msg.attachments)) + "</small>"
+        if msg.embeds:
+            for emb in msg.embeds:
+                if emb.title:
+                    content += f"<br><b>{esc(emb.title)}</b>"
+                if emb.description:
+                    content += f"<br>{esc(emb.description[:400])}"
+        bot_tag = ' <span class="bot">BOT</span>' if msg.author.bot else ""
+        rows.append(
+            f'<div class="msg"><div class="meta"><b>{author}</b>{bot_tag} · {ts}</div>'
+            f'<div class="body">{content}</div></div>'
+        )
+
+    claimed_str = f"{claimed_by}" if claimed_by else "Not claimed"
     html = f"""<!DOCTYPE html>
-<html lang="pl">
-<head>
-<meta charset="utf-8"/>
+<html lang="pl"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Ticket #{ticket_number} — transcript</title>
+<title>Ticket #{ticket_number}</title>
 <style>
-body{{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:#1e1f22;color:#dbdee1}}
+body{{margin:0;font-family:system-ui,sans-serif;background:#1e1f22;color:#dbdee1}}
 .wrap{{max-width:820px;margin:0 auto;padding:24px}}
-h1{{font-size:1.4rem;margin:0 0 8px}}
-.sub{{color:#949ba4;margin-bottom:20px;font-size:.9rem}}
-.info{{background:#2b2d31;border-radius:8px;padding:14px 16px;margin-bottom:20px;font-size:.9rem;line-height:1.6}}
-.msg{{background:#2b2d31;border-radius:8px;padding:12px 14px;margin-bottom:10px}}
-.meta{{color:#949ba4;font-size:.8rem;margin-bottom:6px}}
-.body{{white-space:pre-wrap;word-break:break-word;line-height:1.45}}
-.bot{{background:#5865f2;color:#fff;font-size:.65rem;padding:1px 5px;border-radius:3px;margin-left:4px}}
-a{{color:#00a8fc}}
-</style>
-</head>
-<body>
-<div class="wrap">
+h1{{font-size:1.4rem}}
+.sub{{color:#949ba4;margin-bottom:16px}}
+.info{{background:#2b2d31;border-radius:8px;padding:14px;margin-bottom:16px;line-height:1.6}}
+.msg{{background:#2b2d31;border-radius:8px;padding:12px;margin-bottom:10px}}
+.meta{{color:#949ba4;font-size:.85rem;margin-bottom:6px}}
+.body{{white-space:pre-wrap;word-break:break-word}}
+.bot{{background:#5865f2;color:#fff;font-size:.7rem;padding:1px 5px;border-radius:3px}}
+</style></head><body><div class="wrap">
 <h1>Ticket #{ticket_number}</h1>
-<div class="sub">Read-only transcript · {esc(SERVER_NAME)}</div>
+<div class="sub">{esc(SERVER_NAME)} — przebieg rozmowy</div>
 <div class="info">
 <b>Kategoria:</b> {esc(cat_label)}<br>
-<b>Otwarty przez:</b> &lt;@{opener_id}&gt;<br>
-<b>Zamknięty przez:</b> {esc(str(closer))} ({closer.id})<br>
+<b>Otwarty przez:</b> {opener_id}<br>
+<b>Zamknięty przez:</b> {esc(str(closer))}<br>
 <b>Claim:</b> {esc(claimed_str)}<br>
 <b>Otwarto:</b> {esc(created_at)}<br>
-<b>Zamknięto:</b> {esc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))}<br>
+<b>Zamknięto:</b> {esc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))}<br>
 <b>Powód:</b> {esc(reason or "Brak")}
 </div>
 {"".join(rows) if rows else "<p>Brak wiadomości.</p>"}
-</div>
-</body>
-</html>"""
+</div></body></html>"""
     return html.encode("utf-8")
 
 
@@ -1599,7 +1668,7 @@ async def _close_ticket(
     closer: discord.Member,
     reason: str,
 ):
-    """Zamyka ticket, generuje transcript, wysyła archiwum, usuwa kanał."""
+    """Zamyka ticket, transcript, DM do gracza, archiwum, usuwa kanał."""
     row = await _get_ticket(channel.id)
     if not row:
         return False
@@ -1613,9 +1682,10 @@ async def _close_ticket(
             cat_label = f'{c["emoji"]} {c["label"]}'
             break
 
-    # Transcript HTML
-    html_bytes = await _build_transcript_html(
-        channel,
+    messages = await _collect_ticket_messages(channel)
+
+    txt_bytes = await _build_transcript_txt(
+        messages,
         ticket_number=ticket_number or 0,
         category=category,
         opener_id=owner_id,
@@ -1624,8 +1694,16 @@ async def _close_ticket(
         claimed_by=claimed_by or 0,
         created_at=created_at or "?",
     )
-    filename = f"transcript-ticket-{ticket_number or channel.id}.html"
-    transcript_file = discord.File(io.BytesIO(html_bytes), filename=filename)
+    html_bytes = await _build_transcript_html(
+        messages,
+        ticket_number=ticket_number or 0,
+        category=category,
+        opener_id=owner_id,
+        closer=closer,
+        reason=reason,
+        claimed_by=claimed_by or 0,
+        created_at=created_at or "?",
+    )
 
     async with aiosqlite.connect("moderation.db") as db:
         await db.execute(
@@ -1634,7 +1712,6 @@ async def _close_ticket(
         )
         await db.commit()
 
-    # Czas trwania
     duration_str = "?"
     try:
         opened = datetime.fromisoformat(created_at)
@@ -1651,7 +1728,45 @@ async def _close_ticket(
     except Exception:
         pass
 
-    # Archiwum dla adminów
+    # Zapisz transcript do bazy (przycisk w DM)
+    try:
+        async with aiosqlite.connect("moderation.db") as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO ticket_transcripts (ticket_number, channel_id, content_txt, created_at) VALUES (?,?,?,?)",
+                (
+                    ticket_number or channel.id,
+                    channel.id,
+                    txt_bytes.decode("utf-8", errors="replace"),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"Błąd zapisu transcript: {e}")
+
+    # DM do właściciela ticketa + przycisk "Zobacz przebieg"
+    try:
+        owner = channel.guild.get_member(owner_id) or await bot.fetch_user(owner_id)
+        dm_embed = discord.Embed(
+            title="🔒 Twój ticket został zamknięty",
+            description=(
+                f"**Serwer:** {SERVER_NAME}\n"
+                f"**Ticket:** #{ticket_number or '?'}\n"
+                f"**Kategoria:** {cat_label}\n"
+                f"**Zamknięty przez:** {closer}\n"
+                f"**Powód:** {reason or 'Brak powodu'}\n\n"
+                f"Kliknij przycisk poniżej, aby zobaczyć przebieg rozmowy."
+            ),
+            color=0xE74C3C,
+            timestamp=datetime.now(timezone.utc),
+        )
+        dm_embed.set_footer(text="Jeśli masz pytania — otwórz nowy ticket.")
+        view = TicketTranscriptView(ticket_number or channel.id)
+        await owner.send(embed=dm_embed, view=view)
+    except Exception as e:
+        print(f"Nie udało się wysłać DM o zamknięciu ticketa: {e}")
+
+    # Archiwum adminów: embed + czytelny TXT + HTML do pobrania
     if TICKET_ARCHIVE_CHANNEL_ID:
         arch = channel.guild.get_channel(TICKET_ARCHIVE_CHANNEL_ID)
         if arch:
@@ -1682,12 +1797,23 @@ async def _close_ticket(
             )
             embed.add_field(name="Duration", value=duration_str, inline=True)
             embed.add_field(name="Reason", value=reason or "No reason provided", inline=False)
+            embed.add_field(
+                name="📄 Przebieg",
+                value=(
+                    "• **`.txt`** — otwórz w Discordzie / Notatniku (czytelny tekst)\n"
+                    "• **`.html`** — **pobierz** i otwórz w przeglądarce (ładna strona)"
+                ),
+                inline=False,
+            )
             embed.set_footer(text=SERVER_NAME)
+            files = [
+                discord.File(io.BytesIO(txt_bytes), filename=f"transcript-ticket-{ticket_number or channel.id}.txt"),
+                discord.File(io.BytesIO(html_bytes), filename=f"transcript-ticket-{ticket_number or channel.id}.html"),
+            ]
             try:
-                await arch.send(embed=embed, file=transcript_file)
+                await arch.send(embed=embed, files=files)
             except Exception as e:
                 print(f"Błąd archiwum ticket: {e}")
-                # spróbuj bez pliku
                 try:
                     await arch.send(embed=embed)
                 except Exception:
@@ -1699,6 +1825,55 @@ async def _close_ticket(
     except Exception:
         pass
     return True
+
+
+async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute(
+            "SELECT content_txt FROM ticket_transcripts WHERE ticket_number = ?",
+            (tnum,),
+        )
+        row = await cur.fetchone()
+    if not row or not row[0]:
+        return await interaction.response.send_message(
+            "❌ Przebieg niedostępny (wygasł lub usunięty).", ephemeral=True
+        )
+    data = row[0].encode("utf-8")
+    if len(data) > 7_500_000:
+        data = data[:7_500_000]
+    f = discord.File(io.BytesIO(data), filename=f"przebieg-ticket-{tnum}.txt")
+    await interaction.response.send_message(
+        f"📄 Przebieg ticketa **#{tnum}**:",
+        file=f,
+        ephemeral=True,
+    )
+
+
+class TicketTranscriptView(discord.ui.View):
+    """Przycisk w DM — działa od razu; po restarcie obsługuje on_interaction."""
+
+    def __init__(self, ticket_number: int = 0):
+        super().__init__(timeout=None)
+        self.ticket_number = ticket_number
+        btn = discord.ui.Button(
+            label="Zobacz przebieg ticketa",
+            style=discord.ButtonStyle.primary,
+            emoji="📄",
+            custom_id=f"ticket_transcript:{ticket_number}",
+        )
+
+        async def _cb(interaction: discord.Interaction):
+            tnum = ticket_number
+            cid = (interaction.data or {}).get("custom_id", "")
+            if cid.startswith("ticket_transcript:"):
+                try:
+                    tnum = int(cid.split(":")[1])
+                except Exception:
+                    pass
+            await _send_transcript_file(interaction, tnum)
+
+        btn.callback = _cb
+        self.add_item(btn)
 
 
 class TicketCloseReasonModal(discord.ui.Modal, title="Zamknij ticket z powodem"):
@@ -1790,8 +1965,8 @@ class TicketControlView(discord.ui.View):
         await interaction.response.send_message(embed=embed)
         try:
             name = interaction.channel.name
-            if not name.startswith("claimed-"):
-                await interaction.channel.edit(name=f"claimed-{name.replace('ticket-', '')}")
+            if name.startswith("ticket-") and not name.startswith("claimed-"):
+                await interaction.channel.edit(name=f"claimed-{name[7:]}")
         except Exception:
             pass
 
@@ -1834,7 +2009,7 @@ class TicketControlView(discord.ui.View):
         try:
             name = interaction.channel.name
             if name.startswith("claimed-"):
-                await interaction.channel.edit(name=name.replace("claimed-", "ticket-", 1))
+                await interaction.channel.edit(name=f"ticket-{name[8:]}")
         except Exception:
             pass
 
@@ -1917,15 +2092,16 @@ class TicketSelect(discord.ui.Select):
                 category_obj = None
 
         tnum = await _next_ticket_number()
-        safe_name = re.sub(r"[^a-zA-Z0-9\-]", "", interaction.user.name.lower())[:12] or "user"
-        channel_name = f"ticket-{tnum}-{cat_label.lower()}-{safe_name}"
+        safe_name = re.sub(r"[^a-zA-Z0-9\-]", "", interaction.user.name.lower())[:16] or "user"
+        # Nazwa prosta dla wszystkich: ticket-nick (numer+kategoria tylko w topic — admini widzą)
+        channel_name = f"ticket-{safe_name}"
 
         try:
             ticket_ch = await interaction.guild.create_text_channel(
                 name=channel_name[:90],
                 overwrites=overwrites,
                 category=category_obj,
-                topic=f"Ticket #{tnum} | {cat_label} | {interaction.user} ({interaction.user.id})",
+                topic=f"#{tnum} | {cat_label} | {interaction.user} ({interaction.user.id})",
                 reason=f"Ticket #{tnum}: {cat_label} — {interaction.user}",
             )
         except Exception as e:
