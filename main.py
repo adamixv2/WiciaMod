@@ -1085,7 +1085,8 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="Głos", value="`/moveme` `/move` `/moveall` `/vkick`", inline=False)
     embed.add_field(name="Inne", value="`/roll` `/short` `/rolegive` `/roleremove`", inline=False)
     embed.add_field(name="Temp VC", value="`/tempon` `/tempoff` `/tempmax` `/temptime`", inline=False)
-    embed.add_field(name="Tickety", value="`/ticket_setup` `/ticket_close` `/ticket_sync`", inline=False)
+    embed.add_field(name="Tickety", value="`/ticket_setup` `/ticket_close`", inline=False)
+    embed.add_field(name="System", value="`/sync`", inline=False)
     embed.add_field(name="Konkursy", value="`/giveaway` `/giveaway_end` `/giveaway_reroll`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -2212,249 +2213,6 @@ async def cmd_ticket_close(interaction: discord.Interaction):
     await interaction.response.send_modal(TicketCloseReasonModal(interaction.channel))
 
 
-@bot.tree.command(name="ticket_sync", description="Wymuś synchronizację komend ticketów")
-@is_mod()
-async def cmd_ticket_sync(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        synced = await bot.tree.sync()
-        names = [c.name for c in synced if "ticket" in c.name]
-        await interaction.followup.send(
-            f"✅ Zsynchronizowano **{len(synced)}** komend.\nTickety: {', '.join(f'`/{n}`' for n in names) or 'brak'}",
-            ephemeral=True,
-        )
-    except Exception as e:
-        await interaction.followup.send(f"❌ Błąd sync: `{e}`", ephemeral=True)
-
-
-
-# ===================== GIVEAWAY / KONKURS =====================
-def parse_end_datetime(s: str) -> Optional[datetime]:
-    """Parsuje datę zakończenia: '18:00 28.09.2026' lub '28.09.2026 18:00' lub ISO."""
-    s = (s or "").strip()
-    formats = [
-        "%H:%M %d.%m.%Y",
-        "%d.%m.%Y %H:%M",
-        "%H:%M %d/%m/%Y",
-        "%d/%m/%Y %H:%M",
-        "%Y-%m-%d %H:%M",
-        "%d.%m.%Y",
-        "%Y-%m-%d",
-    ]
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(s, fmt)
-            # zakładamy czas lokalny PL (CEST/CET) → UTC-ish: traktujemy jako Europe/Warsaw ~ UTC+2 latem
-            # prosty offset +2h na CEST (wystarczy do konkursów)
-            dt = dt.replace(tzinfo=timezone(timedelta(hours=2)))
-            return dt
-        except ValueError:
-            continue
-    return None
-
-
-async def _giveaway_entry_count(gid: int) -> int:
-    async with aiosqlite.connect("moderation.db") as db:
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
-        )
-        row = await cur.fetchone()
-        return row[0] if row else 0
-
-
-async def _build_giveaway_embed(
-    *,
-    prize: str,
-    end_at: datetime,
-    winners_count: int,
-    participants: int,
-    host: discord.abc.User,
-    ended: bool = False,
-    winners_mentions: str = None,
-) -> discord.Embed:
-    end_ts = int(end_at.timestamp())
-    if ended:
-        embed = discord.Embed(
-            title="🎉 KONKURS ZAKOŃCZONY",
-            description=f"**Nagroda:** {prize}",
-            color=0x2ECC71,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Zwycięzcy", value=winners_mentions or "Brak uczestników", inline=False)
-        embed.add_field(name="Uczestnicy", value=str(participants), inline=True)
-        embed.add_field(name="Host", value=host.mention if hasattr(host, "mention") else str(host), inline=True)
-    else:
-        embed = discord.Embed(
-            title="🎉 KONKURS",
-            description=f"**Nagroda:** {prize}\n\nKliknij **Dołącz**, aby wziąć udział!",
-            color=0x9B59B6,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Ends", value=f"<t:{end_ts}:F> (<t:{end_ts}:R>)", inline=False)
-        embed.add_field(name="Winners", value=str(winners_count), inline=True)
-        embed.add_field(name="Participants", value=str(participants), inline=True)
-        embed.add_field(name="Host", value=host.mention if hasattr(host, "mention") else str(host), inline=True)
-        embed.set_footer(text="Kliknij Dołącz • Konkurs")
-    return embed
-
-
-async def _end_giveaway(gid: int):
-    async with aiosqlite.connect("moderation.db") as db:
-        cur = await db.execute(
-            "SELECT channel_id, message_id, prize, winners_count, end_at, host_id, ended FROM giveaways WHERE id = ?",
-            (gid,),
-        )
-        row = await cur.fetchone()
-        if not row or row[6]:
-            return
-        channel_id, message_id, prize, winners_count, end_at, host_id, _ = row
-        await db.execute("UPDATE giveaways SET ended = 1 WHERE id = ?", (gid,))
-        cur2 = await db.execute(
-            "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
-        )
-        entries = [r[0] for r in await cur2.fetchall()]
-        await db.commit()
-
-    channel = bot.get_channel(channel_id)
-    if not channel:
-        return
-
-    participants = len(entries)
-    winners = []
-    if entries:
-        k = min(winners_count, len(entries))
-        winners = random.sample(entries, k)
-
-    # Nadaj rolę Klient
-    role = None
-    if GIVEAWAY_WIN_ROLE_ID and channel.guild:
-        role = channel.guild.get_role(GIVEAWAY_WIN_ROLE_ID)
-    for uid in winners:
-        member = channel.guild.get_member(uid) if channel.guild else None
-        if member and role:
-            try:
-                await member.add_roles(role, reason=f"Wygrana w konkursie #{gid}")
-            except Exception:
-                pass
-
-    host = bot.get_user(host_id) or await bot.fetch_user(host_id)
-    end_dt = datetime.fromisoformat(end_at)
-    winners_mentions = ", ".join(f"<@{u}>" for u in winners) if winners else "Brak uczestników"
-    embed = await _build_giveaway_embed(
-        prize=prize,
-        end_at=end_dt,
-        winners_count=winners_count,
-        participants=participants,
-        host=host,
-        ended=True,
-        winners_mentions=winners_mentions,
-    )
-
-    view = discord.ui.View()  # puste — bez przycisku
-    try:
-        msg = await channel.fetch_message(message_id)
-        await msg.edit(embed=embed, view=view)
-    except Exception:
-        try:
-            await channel.send(embed=embed)
-        except Exception:
-            pass
-
-    if winners:
-        await channel.send(
-            f"🎉 **Konkurs zakończony!**\nNagroda: **{prize}**\nZwycięzcy: {winners_mentions}"
-            + (f"\nRola {role.mention} nadana automatycznie." if role else "")
-        )
-    else:
-        await channel.send("🎉 Konkurs zakończony — brak uczestników.")
-
-
-async def giveaway_watcher():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            async with aiosqlite.connect("moderation.db") as db:
-                cur = await db.execute(
-                    "SELECT id, end_at FROM giveaways WHERE ended = 0"
-                )
-                rows = await cur.fetchall()
-            for gid, end_at in rows:
-                try:
-                    end_dt = datetime.fromisoformat(end_at)
-                    if end_dt.tzinfo is None:
-                        end_dt = end_dt.replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) >= end_dt:
-                        await _end_giveaway(gid)
-                except Exception as e:
-                    print(f"Giveaway end error {gid}: {e}")
-        except Exception as e:
-            print(f"Giveaway watcher: {e}")
-        await asyncio.sleep(20)
-
-
-class GiveawayJoinButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(
-            label="Dołącz",
-            style=discord.ButtonStyle.primary,
-            emoji="🎉",
-            custom_id="giveaway_join",
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        # Znajdź giveaway po message_id
-        async with aiosqlite.connect("moderation.db") as db:
-            cur = await db.execute(
-                "SELECT id, ended, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
-                (interaction.message.id,),
-            )
-            row = await cur.fetchone()
-        if not row:
-            return await interaction.response.send_message("❌ Ten konkurs już nie istnieje.", ephemeral=True)
-        gid, ended, prize, winners_count, end_at, host_id = row
-        if ended:
-            return await interaction.response.send_message("❌ Konkurs już zakończony.", ephemeral=True)
-
-        async with aiosqlite.connect("moderation.db") as db:
-            cur = await db.execute(
-                "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
-                (gid, interaction.user.id),
-            )
-            already = await cur.fetchone()
-            if already:
-                return await interaction.response.send_message("✅ Już dołączyłeś do tego konkursu!", ephemeral=True)
-            await db.execute(
-                "INSERT INTO giveaway_entries (giveaway_id, user_id) VALUES (?, ?)",
-                (gid, interaction.user.id),
-            )
-            await db.commit()
-
-        count = await _giveaway_entry_count(gid)
-        end_dt = datetime.fromisoformat(end_at)
-        host = interaction.guild.get_member(host_id) or interaction.user
-        embed = await _build_giveaway_embed(
-            prize=prize,
-            end_at=end_dt,
-            winners_count=winners_count,
-            participants=count,
-            host=host,
-        )
-        try:
-            await interaction.message.edit(embed=embed, view=GiveawayView())
-        except Exception:
-            pass
-        await interaction.response.send_message(
-            f"✅ Dołączyłeś do konkursu! Uczestników: **{count}**", ephemeral=True
-        )
-
-
-class GiveawayView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(GiveawayJoinButton())
-
-
 @bot.tree.command(name="giveaway", description="Utwórz konkurs (giveaway)")
 @app_commands.describe(
     nagroda="Co można wygrać (np. WiciaClient 30 dni)",
@@ -2581,6 +2339,33 @@ async def cmd_giveaway_reroll(
         f"🎲 **Reroll!** Nagroda: **{prize}**\nNowi zwycięzcy: {mentions}"
     )
 
+
+
+
+@bot.tree.command(name="sync", description="Odśwież / zsynchronizuj wszystkie komendy bota")
+@is_mod()
+async def cmd_sync(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # Sync na ten serwer (od razu) + globalnie
+        if interaction.guild:
+            bot.tree.copy_global_to(guild=interaction.guild)
+            guild_synced = await bot.tree.sync(guild=interaction.guild)
+        else:
+            guild_synced = []
+        global_synced = await bot.tree.sync()
+        names = sorted({c.name for c in list(guild_synced) + list(global_synced)})
+        lista = ", ".join(f"`/{n}`" for n in names[:40])
+        more = f"\n... i {len(names) - 40} więcej" if len(names) > 40 else ""
+        await interaction.followup.send(
+            f"✅ **Zsynchronizowano komendy**\n"
+            f"Serwer: **{len(guild_synced)}** · Globalnie: **{len(global_synced)}**\n\n"
+            f"{lista}{more}",
+            ephemeral=True,
+        )
+        print(f"✅ /sync przez {interaction.user}: guild={len(guild_synced)} global={len(global_synced)}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Błąd sync: `{e}`", ephemeral=True)
 
 
 # ===================== START =====================
