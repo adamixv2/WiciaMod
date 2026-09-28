@@ -26,6 +26,7 @@ TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
 TICKET_STAFF_ROLE_ID = int(os.getenv("TICKET_STAFF_ROLE_ID", "0"))  # jeśli 0 → używa MOD_ROLE_ID
 TICKET_ARCHIVE_CHANNEL_ID = int(os.getenv("TICKET_ARCHIVE_CHANNEL_ID", "0"))  # archiwum dla adminów
 GIVEAWAY_WIN_ROLE_ID = int(os.getenv("GIVEAWAY_WIN_ROLE_ID", "0"))  # rola dla zwycięzców (np. Klient)
+SUGGESTION_CHANNEL_ID = int(os.getenv("SUGGESTION_CHANNEL_ID", "0"))  # kanał propozycji
 
 SERVER_NAME = "WiciaClient20PLN"
 TEMP_ENABLED = True
@@ -593,6 +594,47 @@ async def on_voice_state_update(member, before, after):
 async def on_message(message):
     if message.author.bot or not message.guild:
         return
+
+    # ===== PROPOZYCJE =====
+    # Gracz pisze → bot usuwa wiadomość i publikuje jako swoją (embed) + reakcje
+    if SUGGESTION_CHANNEL_ID and message.channel.id == SUGGESTION_CHANNEL_ID:
+        content = (message.content or "").strip()
+        if not content and not message.attachments:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+        embed = discord.Embed(
+            description=content or "*Załącznik*",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_author(
+            name=str(message.author.display_name),
+            icon_url=message.author.display_avatar.url,
+        )
+        embed.set_footer(text=f"Propozycja • ID: {message.author.id}")
+        files = []
+        for att in message.attachments[:3]:
+            if att.content_type and att.content_type.startswith("image/"):
+                embed.set_image(url=att.url)
+                break
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            bot_msg = await message.channel.send(embed=embed)
+            for emoji in ("👍", "👎"):
+                try:
+                    await bot_msg.add_reaction(emoji)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Błąd propozycji: {e}")
+        return
+
     try:
         _, _, _, _, _, text_xp, _ = await get_economy(message.author.id)
         await set_economy(message.author.id, text_xp=text_xp + random.randint(5, 15))
