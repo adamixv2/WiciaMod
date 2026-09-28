@@ -248,6 +248,7 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
         "kicked": f"Zostałeś wyrzucony z serwera **{server}**. | {reason}",
         "softbanned": f"Zostałeś softbanowany na serwerze **{server}**. | {reason}",
         "warned": f"Otrzymałeś ostrzeżenie na serwerze **{server}**. | {reason}",
+        "unwarned": f"Twoje ostrzeżenia na serwerze **{server}** zostały usunięte. | {reason}",
     }
     titles = {
         "muted": "🔇 Zostałeś wyciszony",
@@ -257,6 +258,7 @@ async def notify_user(user, guild=None, *, action, color, reason="Brak powodu", 
         "kicked": "👢 Zostałeś wyrzucony",
         "softbanned": "💨 Softban",
         "warned": "⚠️ Otrzymałeś ostrzeżenie",
+        "unwarned": "✅ Ostrzeżenia usunięte",
     }
     line = lines.get(action, f"Powiadomienie z serwera **{server}**. | {reason}")
     plain = line.replace("**", "")
@@ -425,11 +427,21 @@ async def on_ready():
     bot.add_view(GiveawayView())
     bot.loop.create_task(giveaway_watcher())
     try:
-        synced = await bot.tree.sync()
         print(f"✅ Zalogowano: {bot.user}")
-        print(f"✅ Zsynchronizowano komend: {len(synced)}")
-        for cmd in synced:
-            print(f"   /{cmd.name}")
+        # Tylko komendy SERWEROWE (szybkie, bez duplikatów)
+        total = 0
+        for g in bot.guilds:
+            bot.tree.copy_global_to(guild=g)
+            synced = await bot.tree.sync(guild=g)
+            total = len(synced)
+            print(f"✅ Sync {g.name}: {len(synced)} komend")
+        # Wyczyść GLOBALNE (to one + guild = podwójne komendy)
+        try:
+            if bot.application_id:
+                await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+                print("✅ Wyczyszczono komendy globalne (anty-duplikaty)")
+        except Exception as ge:
+            print(f"⚠ clear global: {ge}")
     except Exception as e:
         print(f"❌ Błąd sync: {e}")
 
@@ -963,6 +975,10 @@ async def cmd_clearwarns(interaction: discord.Interaction, uzytkownik: discord.M
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
+    await notify_user(
+        uzytkownik, interaction.guild,
+        action="unwarned", color=0x00FF00, reason="Wszystkie ostrzeżenia zostały usunięte.",
+    )
 
 
 @bot.tree.command(name="warn_remove", description="Usuń warny")
@@ -977,6 +993,10 @@ async def cmd_warn_remove(interaction: discord.Interaction, uzytkownik: discord.
     embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
+    await notify_user(
+        uzytkownik, interaction.guild,
+        action="unwarned", color=0x00FF00, reason="Twoje ostrzeżenia zostały usunięte.",
+    )
 
 
 @bot.tree.command(name="clear", description="Usuń wiadomości")
@@ -2682,7 +2702,7 @@ async def cmd_giveaway_reroll(
 
 
 
-@bot.tree.command(name="sync", description="Odśwież komendy bota na tym serwerze")
+@bot.tree.command(name="sync", description="Odśwież komendy bota (usuwa duplikaty)")
 @is_mod()
 async def cmd_sync(interaction: discord.Interaction):
     try:
@@ -2694,17 +2714,23 @@ async def cmd_sync(interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.followup.send("❌ Użyj /sync na serwerze.", ephemeral=True)
 
-        # Szybki sync TYLKO na ten serwer (bez globalnego — globalny wiesza na minuty)
-        bot.tree.clear_commands(guild=interaction.guild)
-        await bot.tree.sync(guild=interaction.guild)
+        # 1) Komendy na ten serwer (szybko)
         bot.tree.copy_global_to(guild=interaction.guild)
         synced = await bot.tree.sync(guild=interaction.guild)
+
+        # 2) Usuń GLOBALNE — bez tego Discord pokazuje każdą komendę 2x
+        try:
+            if bot.application_id:
+                await bot.http.bulk_upsert_global_commands(bot.application_id, [])
+        except Exception as ge:
+            print(f"clear global: {ge}")
 
         names = sorted(c.name for c in synced)
         lista = ", ".join(f"`/{n}`" for n in names[:35])
         more = f"\n... +{len(names) - 35}" if len(names) > 35 else ""
         await interaction.followup.send(
-            f"✅ **Gotowe** — **{len(synced)}** komend na serwerze.\n\n{lista}{more}",
+            f"✅ **Gotowe w kilka sekund** — **{len(synced)}** komend (bez duplikatów).\n\n"
+            f"{lista}{more}\n\nOdśwież Discord: **Ctrl+R**",
             ephemeral=True,
         )
         print(f"✅ /sync OK: {len(synced)} komend")
