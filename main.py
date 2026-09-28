@@ -596,7 +596,6 @@ async def on_message(message):
         return
 
     # ===== PROPOZYCJE =====
-    # Gracz pisze → bot usuwa wiadomość i publikuje jako swoją (embed) + reakcje
     if SUGGESTION_CHANNEL_ID and message.channel.id == SUGGESTION_CHANNEL_ID:
         content = (message.content or "").strip()
         if not content and not message.attachments:
@@ -605,28 +604,47 @@ async def on_message(message):
             except Exception:
                 pass
             return
+
+        days = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
+        months = [
+            "", "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca",
+            "lipca", "sierpnia", "września", "października", "listopada", "grudnia",
+        ]
+        now = datetime.now(timezone(timedelta(hours=2)))
+        data_str = (
+            f"{days[now.weekday()]}, {now.day} {months[now.month]} {now.year} "
+            f"{now.hour:02d}:{now.minute:02d}"
+        )
+
+        body = content if content else "*Załącznik*"
+        description = (
+            f"**Treść propozycji:**\n"
+            f"```{body[:1900]}```\n"
+            f"**Wysłana przez:** {message.author.mention}\n"
+            f"**Data:** {data_str}\n\n"
+            f"**Zaznacz poniżej reakcje aby zagłosować!!**"
+        )
+
         embed = discord.Embed(
-            description=content or "*Załącznik*",
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
+            title="Propozycja • WiciaClient",
+            description=description,
+            color=0x1ABC9C,
         )
-        embed.set_author(
-            name=str(message.author.display_name),
-            icon_url=message.author.display_avatar.url,
-        )
-        embed.set_footer(text=f"Propozycja • ID: {message.author.id}")
-        files = []
+        embed.set_thumbnail(url=message.author.display_avatar.url)
+        # bez footera i bez badge
+
         for att in message.attachments[:3]:
             if att.content_type and att.content_type.startswith("image/"):
                 embed.set_image(url=att.url)
                 break
+
         try:
             await message.delete()
         except Exception:
             pass
         try:
             bot_msg = await message.channel.send(embed=embed)
-            for emoji in ("👍", "👎"):
+            for emoji in ("✅", "❌"):
                 try:
                     await bot_msg.add_reaction(emoji)
                 except Exception:
@@ -2664,32 +2682,38 @@ async def cmd_giveaway_reroll(
 
 
 
-@bot.tree.command(name="sync", description="Odśwież / zsynchronizuj wszystkie komendy bota (usuwa duplikaty)")
+@bot.tree.command(name="sync", description="Odśwież komendy bota na tym serwerze")
 @is_mod()
 async def cmd_sync(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
     try:
-        # 1) Usuń komendy przypisane do serwera (to one robią DUPLIKATY obok globalnych)
-        cleared = 0
-        if interaction.guild:
-            bot.tree.clear_commands(guild=interaction.guild)
-            await bot.tree.sync(guild=interaction.guild)
-            cleared = 1
-        # 2) Zostaw tylko globalne komendy (jedna lista, bez x2)
-        synced = await bot.tree.sync()
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+
+    try:
+        if not interaction.guild:
+            return await interaction.followup.send("❌ Użyj /sync na serwerze.", ephemeral=True)
+
+        # Szybki sync TYLKO na ten serwer (bez globalnego — globalny wiesza na minuty)
+        bot.tree.clear_commands(guild=interaction.guild)
+        await bot.tree.sync(guild=interaction.guild)
+        bot.tree.copy_global_to(guild=interaction.guild)
+        synced = await bot.tree.sync(guild=interaction.guild)
+
         names = sorted(c.name for c in synced)
-        lista = ", ".join(f"`/{n}`" for n in names[:40])
-        more = f"\n... i {len(names) - 40} więcej" if len(names) > 40 else ""
+        lista = ", ".join(f"`/{n}`" for n in names[:35])
+        more = f"\n... +{len(names) - 35}" if len(names) > 35 else ""
         await interaction.followup.send(
-            f"✅ **Zsynchronizowano komendy** (bez duplikatów)\n"
-            f"Usunięto kopie serwerowe · Globalnie: **{len(synced)}**\n\n"
-            f"{lista}{more}\n\n"
-            f"Odśwież Discord (Ctrl+R) jeśli nadal widzisz podwójne.",
+            f"✅ **Gotowe** — **{len(synced)}** komend na serwerze.\n\n{lista}{more}",
             ephemeral=True,
         )
-        print(f"✅ /sync przez {interaction.user}: global={len(synced)} cleared_guild={cleared}")
+        print(f"✅ /sync OK: {len(synced)} komend")
     except Exception as e:
-        await interaction.followup.send(f"❌ Błąd sync: `{e}`", ephemeral=True)
+        print(f"❌ /sync error: {e}")
+        try:
+            await interaction.followup.send(f"❌ Błąd: `{e}`", ephemeral=True)
+        except Exception:
+            pass
 
 
 # ===================== START =====================
