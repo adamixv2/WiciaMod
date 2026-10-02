@@ -27,6 +27,15 @@ TICKET_STAFF_ROLE_ID = int(os.getenv("TICKET_STAFF_ROLE_ID", "0"))  # jeśli 0 �
 TICKET_ARCHIVE_CHANNEL_ID = int(os.getenv("TICKET_ARCHIVE_CHANNEL_ID", "0"))  # archiwum dla adminów
 GIVEAWAY_WIN_ROLE_ID = int(os.getenv("GIVEAWAY_WIN_ROLE_ID", "0"))  # rola dla zwycięzców (np. Klient)
 SUGGESTION_CHANNEL_ID = int(os.getenv("SUGGESTION_CHANNEL_ID", "0"))  # kanał propozycji
+MEMBER_COUNT_CHANNEL_ID = int(os.getenv("MEMBER_COUNT_CHANNEL_ID", "0"))  # voice: "Gracze: X" (nie da się wejść)
+# Baza na Railway: ustaw Volume + DB_PATH=/data/moderation.db — inaczej reset przy redeploy!
+DB_PATH = os.getenv("DB_PATH", "moderation.db")
+# ID wykluczone z licznika graczy (np. ownerzy / alt konta)
+MEMBER_COUNT_EXCLUDE = {
+    1552375756871700673,
+    1042355571178868847,
+    1350037082273480735,
+}
 
 SERVER_NAME = "WiciaClient20PLN"
 TEMP_ENABLED = True
@@ -114,7 +123,15 @@ def format_time_human(td: timedelta) -> str:
 
 
 async def init_db():
-    async with aiosqlite.connect("moderation.db") as db:
+    # Utwórz folder bazy (np. /data na Railway volume)
+    try:
+        parent = os.path.dirname(DB_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception as e:
+        print(f"DB path mkdir: {e}")
+    print(f"📂 Baza danych: {DB_PATH}")
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS warnings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER, moderator_id INTEGER, reason TEXT, timestamp TEXT)""")
@@ -185,7 +202,7 @@ async def init_db():
 
 async def get_active_invite_count(inviter_id: int) -> int:
     """Liczba aktywnych zaproszeń (osoby nadal na serwerze są w bazie)."""
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM invites WHERE inviter_id = ?",
             (inviter_id,),
@@ -196,7 +213,7 @@ async def get_active_invite_count(inviter_id: int) -> int:
 
 async def remove_invite_for_member(member_id: int) -> Optional[int]:
     """Usuwa zaproszenie przy wyjściu. Zwraca inviter_id albo None."""
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT inviter_id FROM invites WHERE invited_id = ?",
             (member_id,),
@@ -366,7 +383,7 @@ async def create_welcome_card(member: discord.Member) -> discord.File:
 
 
 async def get_economy(user_id: int):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT credits, last_daily, rep, last_rep, title, text_xp, voice_xp FROM economy WHERE user_id = ?",
             (user_id,),
@@ -380,7 +397,7 @@ async def get_economy(user_id: int):
 
 
 async def set_economy(user_id: int, **kwargs):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO economy (user_id) VALUES (?)", (user_id,))
         for k, v in kwargs.items():
             await db.execute(f"UPDATE economy SET {k} = ? WHERE user_id = ?", (v, user_id))
@@ -388,7 +405,7 @@ async def set_economy(user_id: int, **kwargs):
 
 
 async def get_points(user_id: int) -> int:
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
         if not row:
@@ -399,7 +416,7 @@ async def get_points(user_id: int) -> int:
 
 
 async def set_points(user_id: int, amount: int):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO points (user_id, points) VALUES (?, ?)",
             (user_id, max(0, amount)),
@@ -415,6 +432,47 @@ def level_to_xp(level: int) -> int:
     return (level - 1) ** 2 * 100
 
 
+
+# ===================== LICZNIK GRACZY (kanał voice) =====================
+def count_real_members(guild: discord.Guild) -> int:
+    """Tylko ludzie na serwerze: bez botów i bez wykluczonych ID."""
+    n = 0
+    for m in guild.members:
+        if m.bot:
+            continue
+        if m.id in MEMBER_COUNT_EXCLUDE:
+            continue
+        n += 1
+    return n
+
+
+async def update_member_count_channel(guild: discord.Guild):
+    if not MEMBER_COUNT_CHANNEL_ID:
+        return
+    ch = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
+    if not ch:
+        return
+    count = count_real_members(guild)
+    new_name = f"👥 Gracze: {count}"
+    if ch.name == new_name:
+        return
+    try:
+        await ch.edit(name=new_name, reason="Aktualizacja liczby graczy")
+    except Exception as e:
+        print(f"Member count channel edit: {e}")
+
+
+async def member_count_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            for g in bot.guilds:
+                await update_member_count_channel(g)
+        except Exception as e:
+            print(f"member_count_loop: {e}")
+        await asyncio.sleep(120)  # co 2 min (Discord limituje rename)
+
+
 # ===================== EVENTS =====================
 @bot.event
 async def on_ready():
@@ -426,6 +484,12 @@ async def on_ready():
     bot.add_view(TicketControlView())
     bot.add_view(GiveawayView())
     bot.loop.create_task(giveaway_watcher())
+    bot.loop.create_task(member_count_loop())
+    for g in bot.guilds:
+        try:
+            await update_member_count_channel(g)
+        except Exception:
+            pass
     try:
         print(f"✅ Zalogowano: {bot.user}")
         # Tylko komendy SERWEROWE (szybkie, bez duplikatów)
@@ -487,7 +551,7 @@ async def on_member_join(member: discord.Member):
                 inviter = inv.inviter
                 invite_code = inv.code
                 inviter_id = inviter.id if inviter else 0
-                async with aiosqlite.connect("moderation.db") as db:
+                async with aiosqlite.connect(DB_PATH) as db:
                     # Usuń stare wpisy tej osoby (np. po rejoin) i wstaw aktualny
                     await db.execute("DELETE FROM invites WHERE invited_id = ?", (member.id,))
                     await db.execute(
@@ -529,6 +593,10 @@ async def on_member_join(member: discord.Member):
                 await member.add_roles(role, reason="Automatyczna weryfikacja")
             except Exception:
                 pass
+    try:
+        await update_member_count_channel(member.guild)
+    except Exception:
+        pass
 
 
 @bot.event
@@ -554,6 +622,10 @@ async def on_member_remove(member: discord.Member):
                 await channel.send(f"{member.mention} wyszedł z serwera")
             except Exception:
                 pass
+    try:
+        await update_member_count_channel(member.guild)
+    except Exception:
+        pass
 
 
 @bot.event
@@ -926,7 +998,7 @@ async def cmd_unmutevoice(interaction: discord.Interaction, uzytkownik: discord.
 @app_commands.describe(uzytkownik="Kogo", powod="Powód")
 @is_mod()
 async def cmd_warn(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO warnings (user_id, moderator_id, reason, timestamp) VALUES (?,?,?,?)",
             (uzytkownik.id, interaction.user.id, powod, datetime.now(timezone.utc).isoformat()),
@@ -948,7 +1020,7 @@ async def cmd_warn(interaction: discord.Interaction, uzytkownik: discord.Member,
 @app_commands.describe(uzytkownik="Kogo")
 @is_mod()
 async def cmd_warnings(interaction: discord.Interaction, uzytkownik: discord.Member):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT reason, timestamp, moderator_id FROM warnings WHERE user_id = ? ORDER BY id DESC",
             (uzytkownik.id,),
@@ -967,7 +1039,7 @@ async def cmd_warnings(interaction: discord.Interaction, uzytkownik: discord.Mem
 @app_commands.describe(uzytkownik="Kogo")
 @is_mod()
 async def cmd_clearwarns(interaction: discord.Interaction, uzytkownik: discord.Member):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM warnings WHERE user_id = ?", (uzytkownik.id,))
         await db.commit()
     embed = discord.Embed(title="🧹 Warny wyczyszczone", color=0x00FF00, timestamp=datetime.now(timezone.utc))
@@ -985,7 +1057,7 @@ async def cmd_clearwarns(interaction: discord.Interaction, uzytkownik: discord.M
 @app_commands.describe(uzytkownik="Kogo")
 @is_mod()
 async def cmd_warn_remove(interaction: discord.Interaction, uzytkownik: discord.Member):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM warnings WHERE user_id = ?", (uzytkownik.id,))
         await db.commit()
     embed = discord.Embed(title="🧹 Warny usunięte", color=0x00FF00, timestamp=datetime.now(timezone.utc))
@@ -1181,7 +1253,7 @@ async def cmd_invite(interaction: discord.Interaction):
 @app_commands.describe(uzytkownik="Opcjonalnie")
 async def cmd_invites(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
     target = uzytkownik or interaction.user
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT invited_id, code, timestamp FROM invites WHERE inviter_id = ? ORDER BY timestamp DESC",
             (target.id,),
@@ -1194,7 +1266,7 @@ async def cmd_invites(interaction: discord.Interaction, uzytkownik: Optional[dis
             active.append((invited_id, code, ts))
         else:
             # Sprzątanie śmieci (np. stary wpis sprzed update)
-            async with aiosqlite.connect("moderation.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("DELETE FROM invites WHERE invited_id = ?", (invited_id,))
                 await db.commit()
     embed = discord.Embed(
@@ -1368,7 +1440,7 @@ async def cmd_profile(interaction: discord.Interaction, uzytkownik: Optional[dis
 
 @bot.tree.command(name="top", description="Top XP")
 async def cmd_top(interaction: discord.Interaction):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, text_xp FROM economy ORDER BY text_xp DESC LIMIT 10")
         rows = await cur.fetchall()
     if not rows:
@@ -1407,7 +1479,7 @@ async def cmd_points_set(interaction: discord.Interaction, uzytkownik: discord.M
 
 @bot.tree.command(name="points_list", description="Lista punktów")
 async def cmd_points_list(interaction: discord.Interaction):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id, points FROM points WHERE points > 0 ORDER BY points DESC LIMIT 15")
         rows = await cur.fetchall()
     if not rows:
@@ -1421,7 +1493,7 @@ async def cmd_points_list(interaction: discord.Interaction):
 @app_commands.describe(uzytkownik="Kogo (puste = wszyscy)")
 @is_mod()
 async def cmd_points_reset(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         if uzytkownik:
             await db.execute("UPDATE points SET points = 0 WHERE user_id = ?", (uzytkownik.id,))
             msg = f"✅ Zresetowano punkty {uzytkownik.mention}."
@@ -1592,7 +1664,7 @@ def _is_ticket_staff(member: discord.Member) -> bool:
 
 
 async def _get_ticket(channel_id: int):
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT user_id, category, closed, claimed_by, created_at, ticket_number FROM tickets WHERE channel_id = ?",
             (channel_id,),
@@ -1601,7 +1673,7 @@ async def _get_ticket(channel_id: int):
 
 
 async def _next_ticket_number() -> int:
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COALESCE(MAX(ticket_number), 0) FROM tickets")
         row = await cur.fetchone()
         return (row[0] or 0) + 1
@@ -1762,7 +1834,7 @@ async def _close_ticket(
     )
     humans = await _human_messages_only(messages)
 
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE tickets SET closed = 1, close_reason = ? WHERE channel_id = ?",
             (reason, channel.id),
@@ -1787,7 +1859,7 @@ async def _close_ticket(
 
     # Zapisz transcript do bazy (przycisk w DM)
     try:
-        async with aiosqlite.connect("moderation.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO ticket_transcripts (ticket_number, channel_id, content_txt, created_at) VALUES (?,?,?,?)",
                 (
@@ -1876,7 +1948,7 @@ async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
     # Unikaj podwójnej odpowiedzi (View + listen)
     if interaction.response.is_done():
         return
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT content_txt FROM ticket_transcripts WHERE ticket_number = ?",
             (tnum,),
@@ -2039,7 +2111,7 @@ class TicketControlView(discord.ui.View):
         if claimed_by == interaction.user.id:
             return await interaction.response.send_message("✅ Już claimnąłeś ten ticket.", ephemeral=True)
 
-        async with aiosqlite.connect("moderation.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE tickets SET claimed_by = ? WHERE channel_id = ?",
                 (interaction.user.id, interaction.channel.id),
@@ -2082,7 +2154,7 @@ class TicketControlView(discord.ui.View):
                 f"❌ Ticket claimnięty przez <@{claimed_by}>.", ephemeral=True
             )
 
-        async with aiosqlite.connect("moderation.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE tickets SET claimed_by = 0 WHERE channel_id = ?",
                 (interaction.channel.id,),
@@ -2129,7 +2201,7 @@ class TicketSelect(discord.ui.Select):
         cat_label = cat_info["label"] if cat_info else category
         cat_emoji = cat_info["emoji"] if cat_info else "🎫"
 
-        async with aiosqlite.connect("moderation.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT channel_id FROM tickets WHERE user_id = ? AND closed = 0",
                 (interaction.user.id,),
@@ -2141,7 +2213,7 @@ class TicketSelect(discord.ui.Select):
                 return await interaction.response.send_message(
                     f"❌ Masz już otwarty ticket: {ch.mention}", ephemeral=True
                 )
-            async with aiosqlite.connect("moderation.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute("UPDATE tickets SET closed = 1 WHERE channel_id = ?", (existing[0],))
                 await db.commit()
 
@@ -2197,7 +2269,7 @@ class TicketSelect(discord.ui.Select):
         except Exception as e:
             return await interaction.followup.send(f"❌ Nie udało się utworzyć ticketa: `{e}`", ephemeral=True)
 
-        async with aiosqlite.connect("moderation.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT INTO tickets (channel_id, user_id, category, created_at, closed, claimed_by, ticket_number) VALUES (?,?,?,?,0,0,?)",
                 (ticket_ch.id, interaction.user.id, category, datetime.now(timezone.utc).isoformat(), tnum),
@@ -2352,7 +2424,7 @@ def parse_end_datetime(s: str) -> Optional[datetime]:
 
 
 async def _giveaway_entry_count(gid: int) -> int:
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
         )
@@ -2406,7 +2478,7 @@ async def _build_giveaway_embed(
 
 async def _end_giveaway(gid: int):
     """Losuje zwycięzców (wywoływane dopiero ~30s po oficjalnym końcu)."""
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT channel_id, message_id, prize, winners_count, end_at, host_id, ended FROM giveaways WHERE id = ?",
             (gid,),
@@ -2483,7 +2555,7 @@ async def giveaway_watcher():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            async with aiosqlite.connect("moderation.db") as db:
+            async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute("SELECT id, end_at FROM giveaways WHERE ended = 0")
                 rows = await cur.fetchall()
             now = datetime.now(timezone.utc)
@@ -2512,7 +2584,7 @@ class GiveawayJoinButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        async with aiosqlite.connect("moderation.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT id, ended, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
                 (interaction.message.id,),
@@ -2534,7 +2606,7 @@ class GiveawayJoinButton(discord.ui.Button):
         except Exception:
             pass
 
-        async with aiosqlite.connect("moderation.db") as db:
+        async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
                 (gid, interaction.user.id),
@@ -2609,7 +2681,7 @@ async def cmd_giveaway(
     )
     msg = await channel.send(embed=embed, view=GiveawayView())
 
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "INSERT INTO giveaways (channel_id, message_id, prize, winners_count, end_at, host_id, ended) VALUES (?,?,?,?,?,?,0)",
             (
@@ -2640,7 +2712,7 @@ async def cmd_giveaway_end(interaction: discord.Interaction, message_id: str):
         mid = int(message_id.strip())
     except ValueError:
         return await interaction.response.send_message("❌ Podaj liczbowe ID wiadomości.", ephemeral=True)
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT id, ended FROM giveaways WHERE message_id = ?", (mid,)
         )
@@ -2665,7 +2737,7 @@ async def cmd_giveaway_reroll(
         mid = int(message_id.strip())
     except ValueError:
         return await interaction.response.send_message("❌ Podaj liczbowe ID wiadomości.", ephemeral=True)
-    async with aiosqlite.connect("moderation.db") as db:
+    async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT id, prize, ended FROM giveaways WHERE message_id = ?", (mid,)
         )
@@ -2740,6 +2812,44 @@ async def cmd_sync(interaction: discord.Interaction):
             await interaction.followup.send(f"❌ Błąd: `{e}`", ephemeral=True)
         except Exception:
             pass
+
+
+
+@bot.tree.command(name="membercount_setup", description="Utwórz kanał z liczbą graczy (widać, nie da się wejść)")
+@is_mod()
+async def cmd_membercount_setup(interaction: discord.Interaction):
+    """Tworzy voice channel '👥 Gracze: X' — View tak, Connect nie."""
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=False,
+            speak=False,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            manage_channels=True,
+        ),
+    }
+    count = count_real_members(guild)
+    try:
+        ch = await guild.create_voice_channel(
+            name=f"👥 Gracze: {count}",
+            overwrites=overwrites,
+            reason="Kanał licznika graczy",
+        )
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Nie udało się utworzyć kanału: `{e}`", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ Utworzono {ch.mention}\n"
+        f"**Liczba graczy:** {count} (bez botów i 3 wykluczonych ID)\n\n"
+        f"W Railway ustaw:\n```\nMEMBER_COUNT_CHANNEL_ID={ch.id}\n```\n"
+        f"i zrestartuj bota.",
+        ephemeral=True,
+    )
 
 
 # ===================== START =====================
