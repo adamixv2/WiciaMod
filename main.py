@@ -13,24 +13,39 @@ from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 
 # ===================== KONFIG =====================
+def _env_int(name: str, default: int = 0) -> int:
+    """Bezpieczny int z env — puste '' na Railway nie crashuje bota."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = str(raw).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"⚠ Zła wartość {name}={raw!r} — używam {default}")
+        return default
+
+
 TOKEN = os.getenv("TOKEN")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
-MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", "0"))
-WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
-GOODBYE_CHANNEL_ID = int(os.getenv("GOODBYE_CHANNEL_ID", "0"))
-VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0"))
-TEMP_HUB_CHANNEL_ID = int(os.getenv("TEMP_HUB_CHANNEL_ID", "0"))
-TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0"))
-INVITE_LOG_CHANNEL_ID = int(os.getenv("INVITE_LOG_CHANNEL_ID", "0"))
-TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
-TICKET_STAFF_ROLE_ID = int(os.getenv("TICKET_STAFF_ROLE_ID", "0"))  # jeśli 0 → używa MOD_ROLE_ID
-TICKET_ARCHIVE_CHANNEL_ID = int(os.getenv("TICKET_ARCHIVE_CHANNEL_ID", "0"))  # archiwum dla adminów
-GIVEAWAY_WIN_ROLE_ID = int(os.getenv("GIVEAWAY_WIN_ROLE_ID", "0"))  # rola dla zwycięzców (np. Klient)
-SUGGESTION_CHANNEL_ID = int(os.getenv("SUGGESTION_CHANNEL_ID", "0"))  # kanał propozycji
-MEMBER_COUNT_CHANNEL_ID = int(os.getenv("MEMBER_COUNT_CHANNEL_ID", "0"))  # voice: "Gracze: X" (nie da się wejść)
-# Baza na Railway: ustaw Volume + DB_PATH=/data/moderation.db — inaczej reset przy redeploy!
-DB_PATH = os.getenv("DB_PATH", "moderation.db")
-# ID wykluczone z licznika graczy (np. ownerzy / alt konta)
+LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID")
+MOD_ROLE_ID = _env_int("MOD_ROLE_ID")
+WELCOME_CHANNEL_ID = _env_int("WELCOME_CHANNEL_ID")
+GOODBYE_CHANNEL_ID = _env_int("GOODBYE_CHANNEL_ID")
+VERIFIED_ROLE_ID = _env_int("VERIFIED_ROLE_ID")
+TEMP_HUB_CHANNEL_ID = _env_int("TEMP_HUB_CHANNEL_ID")
+TEMP_CATEGORY_ID = _env_int("TEMP_CATEGORY_ID")
+INVITE_LOG_CHANNEL_ID = _env_int("INVITE_LOG_CHANNEL_ID")
+TICKET_CATEGORY_ID = _env_int("TICKET_CATEGORY_ID")
+TICKET_STAFF_ROLE_ID = _env_int("TICKET_STAFF_ROLE_ID")  # 0 → MOD_ROLE_ID
+TICKET_ARCHIVE_CHANNEL_ID = _env_int("TICKET_ARCHIVE_CHANNEL_ID")
+GIVEAWAY_WIN_ROLE_ID = _env_int("GIVEAWAY_WIN_ROLE_ID")
+SUGGESTION_CHANNEL_ID = _env_int("SUGGESTION_CHANNEL_ID")
+MEMBER_COUNT_CHANNEL_ID = _env_int("MEMBER_COUNT_CHANNEL_ID")  # voice "Gracze: X"
+# Volume na Railway: DB_PATH=/data/moderation.db
+_db = (os.getenv("DB_PATH") or "moderation.db").strip()
+DB_PATH = _db if _db else "moderation.db"
 MEMBER_COUNT_EXCLUDE = {
     1552375756871700673,
     1042355571178868847,
@@ -434,6 +449,10 @@ def level_to_xp(level: int) -> int:
 
 
 # ===================== LICZNIK GRACZY (kanał voice) =====================
+_member_count_lock = asyncio.Lock()
+_last_member_count_name = {}  # channel_id -> last name we set
+
+
 def count_real_members(guild: discord.Guild) -> int:
     """Tylko ludzie na serwerze: bez botów i bez wykluczonych ID."""
     n = 0
@@ -446,23 +465,34 @@ def count_real_members(guild: discord.Guild) -> int:
     return n
 
 
-async def update_member_count_channel(guild: discord.Guild):
+async def update_member_count_channel(guild: discord.Guild, *, force: bool = False):
     if not MEMBER_COUNT_CHANNEL_ID:
         return
-    ch = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
+    ch = guild.get_channel(MEMBER_COUNT_CHANNEL_ID) or bot.get_channel(MEMBER_COUNT_CHANNEL_ID)
     if not ch:
         return
     count = count_real_members(guild)
     new_name = f"👥 Gracze: {count}"
-    if ch.name == new_name:
+    # Discord limituje długość nazwy voice (~100 znaków) — OK
+    if not force and _last_member_count_name.get(ch.id) == new_name:
         return
-    try:
-        await ch.edit(name=new_name, reason="Aktualizacja liczby graczy")
-    except Exception as e:
-        print(f"Member count channel edit: {e}")
+    if not force and ch.name == new_name:
+        _last_member_count_name[ch.id] = new_name
+        return
+    async with _member_count_lock:
+        try:
+            await ch.edit(name=new_name, reason="Aktualizacja liczby graczy")
+            _last_member_count_name[ch.id] = new_name
+            print(f"👥 Licznik graczy: {new_name}")
+        except discord.HTTPException as e:
+            # Rate limit Discord — spróbuj za chwilę w pętli
+            print(f"Member count rate-limit/edit: {e}")
+        except Exception as e:
+            print(f"Member count channel edit: {e}")
 
 
 async def member_count_loop():
+    """Backup co 20s — join/leave i tak odświeża od razu."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
@@ -470,7 +500,7 @@ async def member_count_loop():
                 await update_member_count_channel(g)
         except Exception as e:
             print(f"member_count_loop: {e}")
-        await asyncio.sleep(120)  # co 2 min (Discord limituje rename)
+        await asyncio.sleep(20)
 
 
 # ===================== EVENTS =====================
@@ -601,6 +631,11 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    # Licznik graczy od razu (jeśli nie jest na liście wykluczonych)
+    try:
+        await update_member_count_channel(member.guild, force=True)
+    except Exception:
+        pass
     # Usuń aktywne zaproszenie — licznik invitera spada
     inviter_id = await remove_invite_for_member(member.id)
     if INVITE_LOG_CHANNEL_ID and inviter_id:
