@@ -2887,6 +2887,105 @@ async def cmd_membercount_setup(interaction: discord.Interaction):
     )
 
 
+
+@bot.tree.command(
+    name="chat_restrict",
+    description="Kanał: slowmode 10s + bez GIF-ów / obrazków (dla @everyone)",
+)
+@app_commands.describe(
+    kanal="Kanał tekstowy (domyślnie ten)",
+    sekundy="Slowmode w sekundach (domyślnie 10)",
+)
+@is_mod()
+async def cmd_chat_restrict(
+    interaction: discord.Interaction,
+    kanal: Optional[discord.TextChannel] = None,
+    sekundy: app_commands.Range[int, 0, 21600] = 10,
+):
+    channel = kanal or interaction.channel
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return await interaction.response.send_message("❌ To musi być kanał tekstowy.", ephemeral=True)
+
+    target = channel.parent if isinstance(channel, discord.Thread) else channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.response.send_message("❌ Wybierz zwykły kanał tekstowy.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Slowmode
+    try:
+        await target.edit(slowmode_delay=sekundy, reason=f"chat_restrict przez {interaction.user}")
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Nie mogę ustawić slowmode: `{e}`", ephemeral=True)
+
+    # Blokada GIF-ów / plików / embedów dla @everyone
+    # (Discord nie ma osobnego "no GIF" — to najskuteczniejsze)
+    overwrite = target.overwrites_for(interaction.guild.default_role)
+    overwrite.attach_files = False
+    overwrite.embed_links = False
+    try:
+        await target.set_permissions(
+            interaction.guild.default_role,
+            overwrite=overwrite,
+            reason=f"chat_restrict: bez GIF/obrazków przez {interaction.user}",
+        )
+    except Exception as e:
+        return await interaction.followup.send(
+            f"⚠ Slowmode **{sekundy}s** OK, ale nie mogę zmienić permisji: `{e}`\n"
+            f"Daj botowi **Manage Channels** / **Manage Roles**.",
+            ephemeral=True,
+        )
+
+    await interaction.followup.send(
+        f"✅ **{target.mention}** ustawiony:\n"
+        f"• Slowmode: **{sekundy}s** (1 wiadomość co {sekundy}s)\n"
+        f"• GIF-y / obrazki / pliki: **zablokowane** dla @everyone\n"
+        f"• Embed linki: **zablokowane**\n\n"
+        f"Modowie z wyższymi uprawnieniami nadal mogą wrzucać media.\n"
+        f"Cofnij: `/chat_unrestrict`",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="chat_unrestrict",
+    description="Cofnij ograniczenia chatu (slowmode 0 + GIF-y z powrotem)",
+)
+@app_commands.describe(kanal="Kanał tekstowy (domyślnie ten)")
+@is_mod()
+async def cmd_chat_unrestrict(
+    interaction: discord.Interaction,
+    kanal: Optional[discord.TextChannel] = None,
+):
+    channel = kanal or interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("❌ To musi być kanał tekstowy.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await channel.edit(slowmode_delay=0, reason=f"chat_unrestrict przez {interaction.user}")
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Slowmode: `{e}`", ephemeral=True)
+
+    overwrite = channel.overwrites_for(interaction.guild.default_role)
+    overwrite.attach_files = None  # reset do domyślnych
+    overwrite.embed_links = None
+    try:
+        await channel.set_permissions(
+            interaction.guild.default_role,
+            overwrite=overwrite,
+            reason=f"chat_unrestrict przez {interaction.user}",
+        )
+    except Exception as e:
+        return await interaction.followup.send(f"⚠ Slowmode wyłączony, permisje: `{e}`", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ **{channel.mention}** — slowmode OFF, GIF-y/pliki z powrotem dla @everyone.",
+        ephemeral=True,
+    )
+
+
 # ===================== START =====================
 if __name__ == "__main__":
     if not TOKEN:
