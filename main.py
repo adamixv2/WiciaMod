@@ -709,10 +709,77 @@ async def on_voice_state_update(member, before, after):
             asyncio.create_task(delete_later())
 
 
+# Filtr: TYLKO wyzwiska skierowane + slur-y.
+# NIE kasuje zwykłego: "kurwa", "no kurwa", "chuj wie", "ty idioto"
+_RE_DIRECTED = re.compile(
+    r"(?:\bty\b|\btob[ieę]\b|<@!?\d+>)\s*[,.:\-]*\s*"
+    r"(?:"
+    r"kurwo\b|kurwy\b|"          # NIE "kurwa"
+    r"skurwysyn\w*|"
+    r"suko\b|sukinsyn\w*|"
+    r"pizdo\b|pizdy\b|"          # NIE sama "pizda" w innym kontekście ostrożnie
+    r"chuju\b|chuja\b|"          # NIE samo "chuj"
+    r"huju\b|"
+    r"jebany\b|jebana\b|jebane\b"
+    r")",
+    re.IGNORECASE,
+)
+_RE_DIRECTED_REV = re.compile(
+    r"(?:kurwo|suko|pizdo|chuju|huju)\s+ty\b",
+    re.IGNORECASE,
+)
+# Mowa nienawiści / ciężkie ataki (bez zwykłych przekleństw)
+_RE_HARD = re.compile(
+    r"\b("
+    r"spierdalaj|wypierdalaj|"
+    r"n+i+g+g+[aeer]+|n[i1]gg[aeer]+|"
+    r"fag+ot|fagg?ot|"
+    r"c+u+n+t+|"
+    r"kike\b|tranny\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def message_is_toxic(content: str) -> bool:
+    if not content:
+        return False
+    t = content.replace("@", "a")
+    return bool(
+        _RE_DIRECTED.search(t)
+        or _RE_DIRECTED_REV.search(t)
+        or _RE_HARD.search(t)
+    )
+
+
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
         return
+
+    # ===== FILTR WYZWISK =====
+    # Mode / admin / owner omijają
+    try:
+        if not (
+            message.author.guild_permissions.manage_messages
+            or message.author.guild_permissions.administrator
+            or message.author.id == message.guild.owner_id
+        ):
+            if message_is_toxic(message.content or ""):
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
+                try:
+                    warn = await message.channel.send(
+                        f"{message.author.mention} ❌ Bez takich wyzwisk / mowy nienawiści.",
+                        delete_after=6,
+                    )
+                except Exception:
+                    pass
+                return
+    except Exception:
+        pass
 
     # ===== PROPOZYCJE =====
     if SUGGESTION_CHANNEL_ID and message.channel.id == SUGGESTION_CHANNEL_ID:
@@ -1051,22 +1118,40 @@ async def cmd_warn(interaction: discord.Interaction, uzytkownik: discord.Member,
     await notify_user(uzytkownik, interaction.guild, action="warned", color=0xFFFF00, reason=powod, extra=f"Łącznie warnów: **{count}**")
 
 
-@bot.tree.command(name="warnings", description="Sprawdź ostrzeżenia")
-@app_commands.describe(uzytkownik="Kogo")
+@bot.tree.command(name="warnings", description="Warny użytkownika albo wszystkie na serwerze")
+@app_commands.describe(uzytkownik="Zostaw puste = wszystkie warny na serwerze")
 @is_mod()
-async def cmd_warnings(interaction: discord.Interaction, uzytkownik: discord.Member):
+async def cmd_warnings(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT reason, timestamp, moderator_id FROM warnings WHERE user_id = ? ORDER BY id DESC",
-            (uzytkownik.id,),
-        )
+        if uzytkownik:
+            cur = await db.execute(
+                "SELECT user_id, reason, timestamp, moderator_id FROM warnings WHERE user_id = ? ORDER BY id DESC",
+                (uzytkownik.id,),
+            )
+        else:
+            cur = await db.execute(
+                "SELECT user_id, reason, timestamp, moderator_id FROM warnings ORDER BY id DESC LIMIT 30",
+            )
         rows = await cur.fetchall()
+
     if not rows:
-        return await interaction.response.send_message(f"{uzytkownik.mention} nie ma ostrzeżeń.", ephemeral=True)
-    embed = discord.Embed(title=f"Warny — {uzytkownik}", color=0xFFA500, timestamp=datetime.now(timezone.utc))
-    for i, (reason, ts, mod) in enumerate(rows[:12], 1):
-        embed.add_field(name=f"#{i} • <t:{int(datetime.fromisoformat(ts).timestamp())}:R>", value=f"{reason}\nMod: <@{mod}>", inline=False)
-    embed.set_footer(text=f"Łącznie: {len(rows)}")
+        if uzytkownik:
+            return await interaction.response.send_message(
+                f"{uzytkownik.mention} nie ma ostrzeżeń.", ephemeral=True
+            )
+        return await interaction.response.send_message("Brak warnów na serwerze.", ephemeral=True)
+
+    title = f"Warny — {uzytkownik}" if uzytkownik else "Wszystkie warny na serwerze"
+    embed = discord.Embed(title=title, color=0xFFA500, timestamp=datetime.now(timezone.utc))
+    for i, (uid, reason, ts, mod) in enumerate(rows[:15], 1):
+        try:
+            tshow = f"<t:{int(datetime.fromisoformat(ts).timestamp())}:R>"
+        except Exception:
+            tshow = ts
+        who = f"<@{uid}>" if not uzytkownik else ""
+        val = f"{who + ' • ' if who else ''}{reason}\nMod: <@{mod}>"
+        embed.add_field(name=f"#{i} • {tshow}", value=val[:1024], inline=False)
+    embed.set_footer(text=f"Pokazano {min(len(rows), 15)} / łącznie w wyniku: {len(rows)}")
     await interaction.response.send_message(embed=embed)
 
 
