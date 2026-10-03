@@ -709,43 +709,54 @@ async def on_voice_state_update(member, before, after):
             asyncio.create_task(delete_later())
 
 
-# Filtr wyzwisk / slurów — NIE kasuje zwykłego "kurwa", "chuj wie", "ty idioto"
-# 1) "ty kurwo", "@ktoś cwelu" itd.
+# Filtr wyzwisk
+# WOLNE: kurwa, dupa, szmata, cioto, cepie, idioto, debil (bez "ty"),
+#        frajer, śmieciu, chuj wie, no kurwa, jasne kurwa
 _RE_DIRECTED = re.compile(
     r"(?:\bty\b|\btob[ieę]\b|<@!?\d+>)\s*[,.:\-]*\s*"
     r"(?:"
-    r"kurwo\b|kurwy\b|skurwysyn\w*|"
-    r"suko\b|sukinsyn\w*|"
-    r"pizdo\b|pizdy\b|"
-    r"chuju\b|chuja\b|huju\b|"
-    r"cwelu\b|cwela\b|cwele\b|cwel\b|"
-    r"jebany\b|jebana\b|jebane\b"
+    r"kurwo\b|kurwy\b|skurwysyn\w*|skurwielu\b|skurwiel\b|skurwysynek\b|"
+    r"suko\b|sukinsyn\w*|sukinku\b|"
+    r"pizdo\b|pizdy\b|pizdzie\b|pizdus\w*|"
+    r"chuju\b|chuja\b|huju\b|chujku\b|"
+    r"cwelu\b|cwela\b|cwele\b|cwel\b|cweliku\b|"
+    r"dziwko\b|dziwka\b|dziwki\b|dziweczko\b|"
+    r"szmato\b|"
+    r"jebany\b|jebana\b|jebane\b|jebaka\b|zajebana\b|zajebany\b|dojebany\b|"
+    r"pedale\b|pedal\b|pedalasz\w*|"
+    r"zjebie\b|zjeb\b|wypierdku\b|wypierdek\b|"
+    r"smrodu\b|śmierdzielu\b|smierdzielu\b|gnido\b|gnida\b|"
+    r"zdzir\w*|szczylu\b|pojebie\b|pojeb\b|psycholu\b|"
+    r"debilu\b|mendo\b|menda\b"
     r")",
     re.IGNORECASE,
 )
 _RE_DIRECTED_REV = re.compile(
-    r"(?:kurwo|suko|pizdo|chuju|huju|cwelu|cwela)\s+ty\b",
+    r"(?:kurwo|suko|pizdo|chuju|huju|cwelu|cwela|dziwko|dziwka|szmato|"
+    r"skurwielu|zjebie|gnido|pojebie|mendo)\s+ty\b",
     re.IGNORECASE,
 )
-# 2) Same formy wołacza = zawsze wyzwisko (bez "ty")
 _RE_VOCATIVE = re.compile(
     r"\b("
-    r"kurwo|suko|pizdo|chuju|huju|"
-    r"cwelu|cwela|cwele|"
-    r"skurwysynu|skurwysyn"
+    r"kurwo|suko|pizdo|chuju|huju|chujku|"
+    r"cwelu|cwela|cwele|cweliku|"
+    r"dziwko|dziwka|dziweczko|szmato|"
+    r"skurwysynu|skurwysyn|skurwielu|skurwiel|"
+    r"zjebie|wypierdku|gnido|pojebie|mendo|"
+    r"sukinsynu|sukinsyn"
     r")\b",
     re.IGNORECASE,
 )
-# 3) Slur-y (wszystkie warianty n-word) + ciężkie ataki
-# NIE: kurwa, cioto, cepie, idiota
 _RE_HARD = re.compile(
     r"\b("
-    r"spierdalaj|wypierdalaj|"
-    # n-word: nigger, nigga, niga, niger, nigerrr, n1gga, niqqa, nigg3r...
+    r"spierdalaj|wypierdalaj|spierdolina|spierdoliny|"
+    r"jeba[cć]\s+ci[eę]|jebane?\s+ci[eę]|jebac[cć]?\s+ci[eę]|"
+    r"pierdol\s*si[eę]|pierdolony|pierdolona|"
+    r"rozjebi[eę]\s+ci[eę]|rozjebie\s+ci[eę]|zapierdole\s+ci[eę]|"
     r"n[i1l!]+[gq]+[aeeruhx3]{1,6}|"
     r"fag+ot|fagg?ot|"
     r"c+u+n+t+|"
-    r"kike\b|tranny\b"
+    r"kike\b|tranny\b|retard(?:ed)?\b"
     r")\b",
     re.IGNORECASE,
 )
@@ -761,6 +772,41 @@ def message_is_toxic(content: str) -> bool:
         or _RE_VOCATIVE.search(t)
         or _RE_HARD.search(t)
     )
+
+
+class CultureWarnView(discord.ui.View):
+    """Przycisk 'Anuluj' — usuwa ostrzeżenie (jak dismiss)."""
+
+    def __init__(self, target_id: int):
+        super().__init__(timeout=5)
+        self.target_id = target_id
+
+    @discord.ui.button(label="Anuluj", style=discord.ButtonStyle.secondary, emoji="🗑️")
+    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Tylko autor, mod, admin, owner
+        u = interaction.user
+        ok = (
+            u.id == self.target_id
+            or u.guild_permissions.manage_messages
+            or u.guild_permissions.administrator
+            or (interaction.guild and u.id == interaction.guild.owner_id)
+        )
+        if not ok:
+            return await interaction.response.send_message(
+                "Nie możesz tego anulować.", ephemeral=True
+            )
+        try:
+            await interaction.message.delete()
+        except Exception:
+            try:
+                await interaction.response.defer()
+            except Exception:
+                pass
+            return
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
 
 
 @bot.event
@@ -781,9 +827,12 @@ async def on_message(message):
                     await message.delete()
                 except Exception:
                     pass
+                # Na kanale (nie PV). Discord NIE ma true "Only you can see this"
+                # poza slash/button — ostrzeżenie + Anuluj, znika samo po 15s.
                 try:
-                    await message.channel.send(
-                        "❌ Zachowaj kulturę na chacie.",
+                    warn = await message.channel.send(
+                        f"{message.author.mention} ❌ **Zachowaj kulturę na chacie.**",
+                        view=CultureWarnView(message.author.id),
                         delete_after=5,
                     )
                 except Exception:
