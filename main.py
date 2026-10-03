@@ -709,30 +709,40 @@ async def on_voice_state_update(member, before, after):
             asyncio.create_task(delete_later())
 
 
-# Filtr: TYLKO wyzwiska skierowane + slur-y.
-# NIE kasuje zwykłego: "kurwa", "no kurwa", "chuj wie", "ty idioto"
+# Filtr wyzwisk / slurów — NIE kasuje zwykłego "kurwa", "chuj wie", "ty idioto"
+# 1) "ty kurwo", "@ktoś cwelu" itd.
 _RE_DIRECTED = re.compile(
     r"(?:\bty\b|\btob[ieę]\b|<@!?\d+>)\s*[,.:\-]*\s*"
     r"(?:"
-    r"kurwo\b|kurwy\b|"          # NIE "kurwa"
-    r"skurwysyn\w*|"
+    r"kurwo\b|kurwy\b|skurwysyn\w*|"
     r"suko\b|sukinsyn\w*|"
-    r"pizdo\b|pizdy\b|"          # NIE sama "pizda" w innym kontekście ostrożnie
-    r"chuju\b|chuja\b|"          # NIE samo "chuj"
-    r"huju\b|"
+    r"pizdo\b|pizdy\b|"
+    r"chuju\b|chuja\b|huju\b|"
+    r"cwelu\b|cwela\b|cwele\b|cwel\b|"
     r"jebany\b|jebana\b|jebane\b"
     r")",
     re.IGNORECASE,
 )
 _RE_DIRECTED_REV = re.compile(
-    r"(?:kurwo|suko|pizdo|chuju|huju)\s+ty\b",
+    r"(?:kurwo|suko|pizdo|chuju|huju|cwelu|cwela)\s+ty\b",
     re.IGNORECASE,
 )
-# Mowa nienawiści / ciężkie ataki (bez zwykłych przekleństw)
+# 2) Same formy wołacza = zawsze wyzwisko (bez "ty")
+_RE_VOCATIVE = re.compile(
+    r"\b("
+    r"kurwo|suko|pizdo|chuju|huju|"
+    r"cwelu|cwela|cwele|"
+    r"skurwysynu|skurwysyn"
+    r")\b",
+    re.IGNORECASE,
+)
+# 3) Slur-y (wszystkie warianty n-word) + ciężkie ataki
+# NIE: kurwa, cioto, cepie, idiota
 _RE_HARD = re.compile(
     r"\b("
     r"spierdalaj|wypierdalaj|"
-    r"n+i+g+g+[aeer]+|n[i1]gg[aeer]+|"
+    # n-word: nigger, nigga, niga, niger, nigerrr, n1gga, niqqa, nigg3r...
+    r"n[i1l!]+[gq]+[aeeruhx3]{1,6}|"
     r"fag+ot|fagg?ot|"
     r"c+u+n+t+|"
     r"kike\b|tranny\b"
@@ -748,6 +758,7 @@ def message_is_toxic(content: str) -> bool:
     return bool(
         _RE_DIRECTED.search(t)
         or _RE_DIRECTED_REV.search(t)
+        or _RE_VOCATIVE.search(t)
         or _RE_HARD.search(t)
     )
 
@@ -771,9 +782,9 @@ async def on_message(message):
                 except Exception:
                     pass
                 try:
-                    warn = await message.channel.send(
-                        f"{message.author.mention} ❌ Bez takich wyzwisk / mowy nienawiści.",
-                        delete_after=6,
+                    await message.channel.send(
+                        "❌ Zachowaj kulturę na chacie.",
+                        delete_after=5,
                     )
                 except Exception:
                     pass
