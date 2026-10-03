@@ -709,25 +709,25 @@ async def on_voice_state_update(member, before, after):
             asyncio.create_task(delete_later())
 
 
-# Filtr wyzwisk
-# WOLNE: kurwa, dupa, szmata, cioto, cepie, idioto, debil (bez "ty"),
-#        frajer, śmieciu, chuj wie, no kurwa, jasne kurwa
+# Filtr — tylko MOCNE wyzwiska / slur-y
+# WOLNE (lekkie/średnie): kurwa, dupa, szmata, cioto, cepie, idioto, debil,
+#   frajer/frajerze, śmieciu, biedaku, noob, noobie, chuj wie, no kurwa
 _RE_DIRECTED = re.compile(
     r"(?:\bty\b|\btob[ieę]\b|<@!?\d+>)\s*[,.:\-]*\s*"
     r"(?:"
     r"kurwo\b|kurwy\b|skurwysyn\w*|skurwielu\b|skurwiel\b|skurwysynek\b|"
     r"suko\b|sukinsyn\w*|sukinku\b|"
-    r"pizdo\b|pizdy\b|pizdzie\b|pizdus\w*|"
+    r"pizdo\b|pizdy\b|pizdzie\b|"
     r"chuju\b|chuja\b|huju\b|chujku\b|"
     r"cwelu\b|cwela\b|cwele\b|cwel\b|cweliku\b|"
-    r"dziwko\b|dziwka\b|dziwki\b|dziweczko\b|"
+    r"dziwko\b|dziwka\b|dziweczko\b|"
     r"szmato\b|"
     r"jebany\b|jebana\b|jebane\b|jebaka\b|zajebana\b|zajebany\b|dojebany\b|"
-    r"pedale\b|pedal\b|pedalasz\w*|"
+    r"pedale\b|pedal\b|"
     r"zjebie\b|zjeb\b|wypierdku\b|wypierdek\b|"
-    r"smrodu\b|śmierdzielu\b|smierdzielu\b|gnido\b|gnida\b|"
-    r"zdzir\w*|szczylu\b|pojebie\b|pojeb\b|psycholu\b|"
-    r"debilu\b|mendo\b|menda\b"
+    r"śmierdzielu\b|smierdzielu\b|gnido\b|gnida\b|"
+    r"zdzir\w*|pojebie\b|pojeb\b|psycholu\b|"
+    r"mendo\b|menda\b|skurwysynu\b"
     r")",
     re.IGNORECASE,
 )
@@ -774,41 +774,6 @@ def message_is_toxic(content: str) -> bool:
     )
 
 
-class CultureWarnView(discord.ui.View):
-    """Przycisk 'Anuluj' — usuwa ostrzeżenie (jak dismiss)."""
-
-    def __init__(self, target_id: int):
-        super().__init__(timeout=5)
-        self.target_id = target_id
-
-    @discord.ui.button(label="Anuluj", style=discord.ButtonStyle.secondary, emoji="🗑️")
-    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Tylko autor, mod, admin, owner
-        u = interaction.user
-        ok = (
-            u.id == self.target_id
-            or u.guild_permissions.manage_messages
-            or u.guild_permissions.administrator
-            or (interaction.guild and u.id == interaction.guild.owner_id)
-        )
-        if not ok:
-            return await interaction.response.send_message(
-                "Nie możesz tego anulować.", ephemeral=True
-            )
-        try:
-            await interaction.message.delete()
-        except Exception:
-            try:
-                await interaction.response.defer()
-            except Exception:
-                pass
-            return
-        try:
-            await interaction.response.defer()
-        except Exception:
-            pass
-
-
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
@@ -830,9 +795,8 @@ async def on_message(message):
                 # Na kanale (nie PV). Discord NIE ma true "Only you can see this"
                 # poza slash/button — ostrzeżenie + Anuluj, znika samo po 15s.
                 try:
-                    warn = await message.channel.send(
+                    await message.channel.send(
                         f"{message.author.mention} ❌ **Zachowaj kulturę na chacie.**",
-                        view=CultureWarnView(message.author.id),
                         delete_after=5,
                     )
                 except Exception:
