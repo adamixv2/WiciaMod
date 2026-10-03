@@ -450,11 +450,13 @@ def level_to_xp(level: int) -> int:
 
 # ===================== LICZNIK GRACZY (kanał voice) =====================
 _member_count_lock = asyncio.Lock()
-_last_member_count_name = {}  # channel_id -> last name we set
+_last_member_count_name = {}
+_last_member_count_edit_at = {}  # channel_id -> monotonic time
+_member_count_dirty = set()  # guild ids do odświeżenia
+_MC_MIN_INTERVAL = 180  # min. 3 min między rename (Discord mocno limituje)
 
 
 def count_real_members(guild: discord.Guild) -> int:
-    """Tylko ludzie na serwerze: bez botów i bez wykluczonych ID."""
     n = 0
     for m in guild.members:
         if m.bot:
@@ -465,6 +467,11 @@ def count_real_members(guild: discord.Guild) -> int:
     return n
 
 
+def mark_member_count_dirty(guild: discord.Guild):
+    if MEMBER_COUNT_CHANNEL_ID and guild:
+        _member_count_dirty.add(guild.id)
+
+
 async def update_member_count_channel(guild: discord.Guild, *, force: bool = False):
     if not MEMBER_COUNT_CHANNEL_ID:
         return
@@ -473,34 +480,51 @@ async def update_member_count_channel(guild: discord.Guild, *, force: bool = Fal
         return
     count = count_real_members(guild)
     new_name = f"👥 Gracze: {count}"
-    # Discord limituje długość nazwy voice (~100 znaków) — OK
-    if not force and _last_member_count_name.get(ch.id) == new_name:
-        return
-    if not force and ch.name == new_name:
+    if ch.name == new_name or _last_member_count_name.get(ch.id) == new_name:
         _last_member_count_name[ch.id] = new_name
+        _member_count_dirty.discard(guild.id)
         return
+
+    import time as _time
+    now = _time.monotonic()
+    last = _last_member_count_edit_at.get(ch.id, 0)
+    if not force and (now - last) < _MC_MIN_INTERVAL:
+        _member_count_dirty.add(guild.id)
+        return
+
     async with _member_count_lock:
+        now = _time.monotonic()
+        last = _last_member_count_edit_at.get(ch.id, 0)
+        if not force and (now - last) < _MC_MIN_INTERVAL:
+            _member_count_dirty.add(guild.id)
+            return
         try:
-            await ch.edit(name=new_name, reason="Aktualizacja liczby graczy")
+            await ch.edit(name=new_name, reason="Liczba graczy")
             _last_member_count_name[ch.id] = new_name
+            _last_member_count_edit_at[ch.id] = _time.monotonic()
+            _member_count_dirty.discard(guild.id)
             print(f"👥 Licznik graczy: {new_name}")
         except discord.HTTPException as e:
-            # Rate limit Discord — spróbuj za chwilę w pętli
-            print(f"Member count rate-limit/edit: {e}")
+            _member_count_dirty.add(guild.id)
+            print(f"Member count edit: {e}")
         except Exception as e:
-            print(f"Member count channel edit: {e}")
+            print(f"Member count edit: {e}")
 
 
 async def member_count_loop():
-    """Backup co 20s — join/leave i tak odświeża od razu."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
+            for gid in list(_member_count_dirty):
+                g = bot.get_guild(gid)
+                if g:
+                    await update_member_count_channel(g)
+            # rzadki pełny refresh
             for g in bot.guilds:
                 await update_member_count_channel(g)
         except Exception as e:
             print(f"member_count_loop: {e}")
-        await asyncio.sleep(20)
+        await asyncio.sleep(90)
 
 
 # ===================== EVENTS =====================
@@ -623,19 +647,12 @@ async def on_member_join(member: discord.Member):
                 await member.add_roles(role, reason="Automatyczna weryfikacja")
             except Exception:
                 pass
-    try:
-        await update_member_count_channel(member.guild)
-    except Exception:
-        pass
+    mark_member_count_dirty(member.guild)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    # Licznik graczy od razu (jeśli nie jest na liście wykluczonych)
-    try:
-        await update_member_count_channel(member.guild, force=True)
-    except Exception:
-        pass
+    mark_member_count_dirty(member.guild)
     # Usuń aktywne zaproszenie — licznik invitera spada
     inviter_id = await remove_invite_for_member(member.id)
     if INVITE_LOG_CHANNEL_ID and inviter_id:
@@ -657,10 +674,7 @@ async def on_member_remove(member: discord.Member):
                 await channel.send(f"{member.mention} wyszedł z serwera")
             except Exception:
                 pass
-    try:
-        await update_member_count_channel(member.guild)
-    except Exception:
-        pass
+    mark_member_count_dirty(member.guild)
 
 
 @bot.event
@@ -1383,7 +1397,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="Temp VC", value="`/tempon` `/tempoff` `/tempmax` `/temptime`", inline=False)
     embed.add_field(name="Tickety", value="`/ticket_setup` `/ticket_close`", inline=False)
     embed.add_field(name="System", value="`/sync`", inline=False)
-    embed.add_field(name="Konkursy", value="`/giveaway` `/giveaway_end` `/giveaway_reroll`", inline=False)
+    embed.add_field(name="Konkursy", value="`/giveaway` `/giveaway_end` `/giveaway_reroll` `/giveaway_list`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -2718,6 +2732,35 @@ async def giveaway_watcher():
         await asyncio.sleep(5)  # sprawdzaj co 5s — prawie od razu po końcu
 
 
+async def _gw_get(message_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, ended, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
+            (message_id,),
+        )
+        return await cur.fetchone()
+
+
+async def _gw_refresh_embed(interaction: discord.Interaction, row):
+    gid, ended, prize, winners_count, end_at, host_id = row
+    count = await _giveaway_entry_count(gid)
+    end_dt = datetime.fromisoformat(end_at)
+    host = interaction.guild.get_member(host_id) if interaction.guild else interaction.user
+    embed = await _build_giveaway_embed(
+        prize=prize,
+        end_at=end_dt,
+        winners_count=winners_count,
+        participants=count,
+        host=host or interaction.user,
+        ended=bool(ended),
+    )
+    try:
+        await interaction.message.edit(embed=embed, view=GiveawayView())
+    except Exception:
+        pass
+    return count
+
+
 class GiveawayJoinButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
@@ -2728,12 +2771,7 @@ class GiveawayJoinButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT id, ended, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
-                (interaction.message.id,),
-            )
-            row = await cur.fetchone()
+        row = await _gw_get(interaction.message.id)
         if not row:
             return await interaction.response.send_message("❌ Ten konkurs już nie istnieje.", ephemeral=True)
         gid, ended, prize, winners_count, end_at, host_id = row
@@ -2755,31 +2793,108 @@ class GiveawayJoinButton(discord.ui.Button):
                 "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
                 (gid, interaction.user.id),
             )
-            already = await cur.fetchone()
-            if already:
-                return await interaction.response.send_message("✅ Już dołączyłeś do tego konkursu!", ephemeral=True)
+            if await cur.fetchone():
+                return await interaction.response.send_message(
+                    "✅ Już jesteś zapisany. Możesz kliknąć **Wyjdź**, żeby się wypisać.",
+                    ephemeral=True,
+                )
             await db.execute(
                 "INSERT INTO giveaway_entries (giveaway_id, user_id) VALUES (?, ?)",
                 (gid, interaction.user.id),
             )
             await db.commit()
 
-        count = await _giveaway_entry_count(gid)
-        end_dt = datetime.fromisoformat(end_at)
-        host = interaction.guild.get_member(host_id) if interaction.guild else interaction.user
-        embed = await _build_giveaway_embed(
-            prize=prize,
-            end_at=end_dt,
-            winners_count=winners_count,
-            participants=count,
-            host=host or interaction.user,
-        )
-        try:
-            await interaction.message.edit(embed=embed, view=GiveawayView())
-        except Exception:
-            pass
+        count = await _gw_refresh_embed(interaction, row)
         await interaction.response.send_message(
-            f"✅ Dołączyłeś do konkursu! Uczestników: **{count}**", ephemeral=True
+            f"✅ Dołączyłeś! Uczestników: **{count}**\n"
+            f"Żeby wyjść — kliknij przycisk **Wyjdź**.",
+            ephemeral=True,
+        )
+
+
+class GiveawayLeaveButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Wyjdź",
+            style=discord.ButtonStyle.secondary,
+            emoji="🚪",
+            custom_id="giveaway_leave",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        row = await _gw_get(interaction.message.id)
+        if not row:
+            return await interaction.response.send_message("❌ Ten konkurs już nie istnieje.", ephemeral=True)
+        gid, ended, *_ = row
+        if ended:
+            return await interaction.response.send_message("❌ Konkurs już zakończony.", ephemeral=True)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
+                (gid, interaction.user.id),
+            )
+            if not await cur.fetchone():
+                return await interaction.response.send_message(
+                    "❌ Nie jesteś zapisany w tym konkursie.", ephemeral=True
+                )
+            await db.execute(
+                "DELETE FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
+                (gid, interaction.user.id),
+            )
+            await db.commit()
+
+        count = await _gw_refresh_embed(interaction, row)
+        await interaction.response.send_message(
+            f"🚪 Wypisałeś się z konkursu. Uczestników: **{count}**",
+            ephemeral=True,
+        )
+
+
+class GiveawayListButton(discord.ui.Button):
+    """Lista uczestników — tylko mod/owner (odpowiedź ephemeral)."""
+
+    def __init__(self):
+        super().__init__(
+            label="Uczestnicy",
+            style=discord.ButtonStyle.success,
+            emoji="📋",
+            custom_id="giveaway_list",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        u = interaction.user
+        is_staff = (
+            (interaction.guild and u.id == interaction.guild.owner_id)
+            or u.guild_permissions.administrator
+            or u.guild_permissions.manage_guild
+            or (MOD_ROLE_ID and any(r.id == MOD_ROLE_ID for r in getattr(u, "roles", [])))
+        )
+        if not is_staff:
+            return await interaction.response.send_message(
+                "❌ Tylko admin / owner / mod widzi listę uczestników.",
+                ephemeral=True,
+            )
+
+        row = await _gw_get(interaction.message.id)
+        if not row:
+            return await interaction.response.send_message("❌ Nie znaleziono konkursu.", ephemeral=True)
+        gid = row[0]
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ? ORDER BY rowid",
+                (gid,),
+            )
+            ids = [r[0] for r in await cur.fetchall()]
+
+        if not ids:
+            return await interaction.response.send_message("Brak uczestników.", ephemeral=True)
+
+        lines = [f"{i}. <@{uid}> (`{uid}`)" for i, uid in enumerate(ids[:50], 1)]
+        more = f"\n… i **{len(ids) - 50}** więcej" if len(ids) > 50 else ""
+        await interaction.response.send_message(
+            f"📋 **Uczestnicy ({len(ids)}):**\n" + "\n".join(lines) + more,
+            ephemeral=True,
         )
 
 
@@ -2787,6 +2902,8 @@ class GiveawayView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(GiveawayJoinButton())
+        self.add_item(GiveawayLeaveButton())
+        self.add_item(GiveawayListButton())
 
 
 @bot.tree.command(name="giveaway", description="Utwórz konkurs (giveaway)")
@@ -2916,6 +3033,51 @@ async def cmd_giveaway_reroll(
     )
 
 
+@bot.tree.command(name="giveaway_list", description="Aktywne konkursy zapisane w bazie")
+@is_mod()
+async def cmd_giveaway_list(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """SELECT id, channel_id, message_id, prize, winners_count, end_at, host_id, ended
+               FROM giveaways ORDER BY id DESC LIMIT 15"""
+        )
+        rows = await cur.fetchall()
+        counts = {}
+        for r in rows:
+            c = await db.execute(
+                "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (r[0],)
+            )
+            counts[r[0]] = (await c.fetchone())[0]
+
+    if not rows:
+        return await interaction.response.send_message(
+            "Brak konkursów w bazie.", ephemeral=True
+        )
+
+    lines = []
+    for gid, ch_id, msg_id, prize, wcount, end_at, host_id, ended in rows:
+        try:
+            end_dt = datetime.fromisoformat(end_at)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            end_txt = f"<t:{int(end_dt.timestamp())}:f>"
+        except Exception:
+            end_txt = end_at
+        status = "🔚 zakończony" if ended else "🟢 aktywny"
+        lines.append(
+            f"**#{gid}** {status} · <#{ch_id}>\n"
+            f"Nagroda: **{prize}** · osób: **{counts.get(gid, 0)}** · wygranych: {wcount}\n"
+            f"Koniec: {end_txt} · host: <@{host_id}>\n"
+            f"ID wiadomości: `{msg_id}`"
+        )
+
+    embed = discord.Embed(
+        title="Konkursy w bazie",
+        description="\n\n".join(lines)[:4000],
+        color=0x9B59B6,
+    )
+    embed.set_footer(text=f"DB: {DB_PATH}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="sync", description="Odśwież komendy bota (usuwa duplikaty)")
