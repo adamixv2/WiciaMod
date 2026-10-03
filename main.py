@@ -2872,7 +2872,7 @@ class GiveawayListButton(discord.ui.Button):
         )
         if not is_staff:
             return await interaction.response.send_message(
-                "❌ Tylko admin / owner / mod widzi listę uczestników.",
+                "❌ Nie masz permisji.",
                 ephemeral=True,
             )
 
