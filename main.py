@@ -212,11 +212,27 @@ async def init_db():
             reason TEXT,
             banned_by INTEGER,
             timestamp TEXT)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS giveaway_winners (
+            giveaway_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY (giveaway_id, user_id))""")
         await db.execute("""CREATE TABLE IF NOT EXISTS ticket_transcripts (
             ticket_number INTEGER PRIMARY KEY,
             channel_id INTEGER,
             content_txt TEXT,
             created_at TEXT)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS ticket_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER,
+            message_id INTEGER UNIQUE,
+            author_id INTEGER,
+            author_name TEXT,
+            content TEXT,
+            is_bot INTEGER DEFAULT 0,
+            created_at TEXT)""")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ticket_msgs_ch ON ticket_messages(channel_id)"
+        )
         await db.commit()
 
 
@@ -795,7 +811,18 @@ def message_is_toxic(content: str) -> bool:
 
 @bot.event
 async def on_message(message):
-    if message.author.bot or not message.guild:
+    if not message.guild:
+        return
+
+    # Log ticketa NA BIEŻĄCO (także bot — potem filtrujemy przy exportcie)
+    try:
+        row = await _get_ticket(message.channel.id)
+        if row:
+            await _log_ticket_message(message)
+    except Exception:
+        pass
+
+    if message.author.bot:
         return
 
     # ===== FILTR WYZWISK =====
@@ -1842,31 +1869,112 @@ async def _next_ticket_number() -> int:
         return (row[0] or 0) + 1
 
 
+async def _log_ticket_message(message: discord.Message):
+    """Zapis na bieżąco — nie ginie przy zamknięciu / limicie historii."""
+    if not message.guild or not message.channel:
+        return
+    content = (message.content or "").strip()
+    if message.attachments:
+        atts = ", ".join(a.filename for a in message.attachments)
+        content = (content + f" [pliki: {atts}]").strip()
+    if not content and not message.embeds:
+        return
+    if not content and message.embeds:
+        # krótki opis embedów (np. systemowe)
+        parts = []
+        for e in message.embeds[:2]:
+            if e.title:
+                parts.append(str(e.title))
+            if e.description:
+                parts.append(str(e.description)[:300])
+        content = " | ".join(parts) if parts else "[embed]"
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """INSERT OR IGNORE INTO ticket_messages
+                   (channel_id, message_id, author_id, author_name, content, is_bot, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    message.channel.id,
+                    message.id,
+                    message.author.id,
+                    str(message.author.display_name),
+                    content,
+                    1 if message.author.bot else 0,
+                    (message.created_at.replace(tzinfo=timezone.utc).isoformat()
+                     if message.created_at else datetime.now(timezone.utc).isoformat()),
+                ),
+            )
+            await db.commit()
+    except Exception as e:
+        print(f"ticket msg log: {e}")
+
+
 async def _collect_ticket_messages(channel: discord.TextChannel):
+    """Pełna historia z Discord + backup z bazy (na bieżąco)."""
     messages = []
     try:
-        async for msg in channel.history(limit=500, oldest_first=True):
+        # limit=None = wszystkie wiadomości na kanale
+        async for msg in channel.history(limit=None, oldest_first=True):
             messages.append(msg)
-    except Exception:
-        pass
+            try:
+                await _log_ticket_message(msg)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"ticket history fetch: {e}")
     return messages
 
 
 async def _human_messages_only(messages):
-    """Tylko wiadomości od ludzi (bez botów), z treścią."""
+    """Ludzie z historii Discord; jeśli pusto — z bazy ticket_messages."""
     out = []
+    seen = set()
     for msg in messages:
         if msg.author.bot:
             continue
         content = (msg.content or "").strip()
-        if not content and not msg.attachments:
-            continue
-        line = content if content else ""
         if msg.attachments:
             atts = ", ".join(a.filename for a in msg.attachments)
-            line = (line + f" [pliki: {atts}]").strip()
-        out.append({"author": str(msg.author.display_name), "content": line})
-    return out
+            content = (content + f" [pliki: {atts}]").strip()
+        if not content:
+            continue
+        key = msg.id
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"author": str(msg.author.display_name), "content": content, "mid": msg.id})
+
+    if out:
+        return [{"author": h["author"], "content": h["content"]} for h in out]
+
+    # Fallback: log z bazy
+    try:
+        ch_id = messages[0].channel.id if messages else None
+        if not ch_id:
+            return out
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                """SELECT author_name, content FROM ticket_messages
+                   WHERE channel_id = ? AND is_bot = 0 AND content != ''
+                   ORDER BY id ASC""",
+                (ch_id,),
+            )
+            rows = await cur.fetchall()
+        return [{"author": r[0], "content": r[1]} for r in rows]
+    except Exception:
+        return out
+
+
+async def _humans_from_db(channel_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """SELECT author_name, content FROM ticket_messages
+               WHERE channel_id = ? AND is_bot = 0 AND content != ''
+               ORDER BY id ASC""",
+            (channel_id,),
+        )
+        return [{"author": r[0], "content": r[1]} for r in await cur.fetchall()]
 
 
 async def _build_transcript_txt(
@@ -1879,6 +1987,7 @@ async def _build_transcript_txt(
     reason: str,
     claimed_by: int,
     created_at: str,
+    humans_override=None,
 ) -> bytes:
     """Czytelny TXT — tylko ludzie, bez dat i bez wiadomości bota."""
     cat_label = category
@@ -1886,7 +1995,7 @@ async def _build_transcript_txt(
         if c["value"] == category:
             cat_label = c["label"]
             break
-    humans = await _human_messages_only(messages)
+    humans = humans_override if humans_override is not None else await _human_messages_only(messages)
     lines = [
         f"=== Przebieg rozmowy ===",
         f"Serwer: {SERVER_NAME}",
@@ -1983,7 +2092,19 @@ async def _close_ticket(
             cat_label = f'{c["emoji"]} {c["label"]}'
             break
 
+    # Najpierw zbierz historię (i dociągnij do logu), potem buduj transcript
     messages = await _collect_ticket_messages(channel)
+    humans = await _human_messages_only(messages)
+    if not humans:
+        humans = await _humans_from_db(channel.id)
+
+    # Zawsze preferuj pełniejszy log z bazy, jeśli ma więcej wpisów
+    try:
+        db_humans = await _humans_from_db(channel.id)
+        if len(db_humans) > len(humans):
+            humans = db_humans
+    except Exception:
+        pass
 
     txt_bytes = await _build_transcript_txt(
         messages,
@@ -1994,8 +2115,8 @@ async def _close_ticket(
         reason=reason,
         claimed_by=claimed_by or 0,
         created_at=created_at or "?",
+        humans_override=humans,
     )
-    humans = await _human_messages_only(messages)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -2639,8 +2760,13 @@ async def _build_giveaway_embed(
     return embed
 
 
+def _gw_rng():
+    """Losowanie niezależne od stałego seeda."""
+    return random.SystemRandom()
+
+
 async def _end_giveaway(gid: int):
-    """Losuje zwycięzców (wywoływane dopiero ~30s po oficjalnym końcu)."""
+    """Losuje zwycięzców i ogłasza na kanale konkursu."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT channel_id, message_id, prize, winners_count, end_at, host_id, ended FROM giveaways WHERE id = ?",
@@ -2655,23 +2781,36 @@ async def _end_giveaway(gid: int):
             "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
         )
         entries = [r[0] for r in await cur2.fetchall()]
+        # wyklucz zbanowanych
+        cur3 = await db.execute("SELECT user_id FROM giveaway_bans")
+        banned = {r[0] for r in await cur3.fetchall()}
+        entries = [u for u in entries if u not in banned]
+
+        participants = len(entries)
+        winners = []
+        if entries:
+            k = min(int(winners_count), len(entries))
+            winners = _gw_rng().sample(entries, k)
+            for uid in winners:
+                await db.execute(
+                    "INSERT OR IGNORE INTO giveaway_winners (giveaway_id, user_id) VALUES (?, ?)",
+                    (gid, uid),
+                )
         await db.commit()
 
     channel = bot.get_channel(channel_id)
     if not channel:
-        return
-
-    participants = len(entries)
-    winners = []
-    if entries:
-        k = min(winners_count, len(entries))
-        winners = random.sample(entries, k)
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return
 
     role = None
-    if GIVEAWAY_WIN_ROLE_ID and getattr(channel, "guild", None):
-        role = channel.guild.get_role(GIVEAWAY_WIN_ROLE_ID)
+    guild = getattr(channel, "guild", None)
+    if GIVEAWAY_WIN_ROLE_ID and guild:
+        role = guild.get_role(GIVEAWAY_WIN_ROLE_ID)
     for uid in winners:
-        member = channel.guild.get_member(uid) if channel.guild else None
+        member = guild.get_member(uid) if guild else None
         if member and role:
             try:
                 await member.add_roles(role, reason=f"Wygrana w konkursie #{gid}")
@@ -2704,9 +2843,12 @@ async def _end_giveaway(gid: int):
 
     if winners:
         extra = f"\nRola {role.mention} nadana automatycznie." if role else ""
-        await channel.send(
-            f"🎉 **Konkurs zakończony!**\nNagroda: **{prize}**\nZwycięzcy: {winners_mentions}{extra}"
-        )
+        try:
+            await channel.send(
+                f"🎉 **Konkurs zakończony!**\nNagroda: **{prize}**\nZwycięzcy: {winners_mentions}{extra}"
+            )
+        except Exception:
+            pass
     else:
         try:
             await channel.send("🎉 Konkurs zakończony — brak uczestników.")
@@ -3001,7 +3143,7 @@ async def cmd_giveaway_end(interaction: discord.Interaction, message_id: str):
     await _end_giveaway(row[0])
 
 
-@bot.tree.command(name="giveaway_reroll", description="Wylosuj ponownie zwycięzcę konkursu")
+@bot.tree.command(name="giveaway_reroll", description="Wylosuj ponownie zwycięzcę (ogłoszenie na kanale konkursu)")
 @app_commands.describe(message_id="ID wiadomości konkursu", ilosc="Ilu nowych zwycięzców")
 @is_mod()
 async def cmd_giveaway_reroll(
@@ -3013,38 +3155,88 @@ async def cmd_giveaway_reroll(
         mid = int(message_id.strip())
     except ValueError:
         return await interaction.response.send_message("❌ Podaj liczbowe ID wiadomości.", ephemeral=True)
+
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, prize, ended FROM giveaways WHERE message_id = ?", (mid,)
+            "SELECT id, prize, ended, channel_id FROM giveaways WHERE message_id = ?",
+            (mid,),
         )
         row = await cur.fetchone()
         if not row:
             return await interaction.response.send_message("❌ Nie znaleziono konkursu.", ephemeral=True)
-        gid, prize, ended = row
+        gid, prize, ended, channel_id = row
         if not ended:
-            return await interaction.response.send_message("❌ Najpierw zakończ konkurs.", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Najpierw zakończ konkurs (`/giveaway_end`).", ephemeral=True
+            )
         cur = await db.execute(
             "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
         )
         entries = [r[0] for r in await cur.fetchall()]
-    if not entries:
-        return await interaction.response.send_message("❌ Brak uczestników.", ephemeral=True)
-    winners = random.sample(entries, min(ilosc, len(entries)))
-    mentions = ", ".join(f"<@{u}>" for u in winners)
+        cur = await db.execute(
+            "SELECT user_id FROM giveaway_winners WHERE giveaway_id = ?", (gid,)
+        )
+        prev_winners = {r[0] for r in await cur.fetchall()}
+        cur = await db.execute("SELECT user_id FROM giveaway_bans")
+        banned = {r[0] for r in await cur.fetchall()}
+
+    # Pula: uczestnicy bez poprzednich zwycięzców i bez banów
+    pool = [u for u in entries if u not in prev_winners and u not in banned]
+    used_fallback = False
+    if not pool:
+        pool = [u for u in entries if u not in banned]
+        used_fallback = True
+    if not pool:
+        return await interaction.response.send_message(
+            "❌ Brak osób do wylosowania.", ephemeral=True
+        )
+
+    k = min(ilosc, len(pool))
+    winners = _gw_rng().sample(pool, k)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for uid in winners:
+            await db.execute(
+                "INSERT OR IGNORE INTO giveaway_winners (giveaway_id, user_id) VALUES (?, ?)",
+                (gid, uid),
+            )
+        await db.commit()
 
     role = None
-    if GIVEAWAY_WIN_ROLE_ID:
+    if GIVEAWAY_WIN_ROLE_ID and interaction.guild:
         role = interaction.guild.get_role(GIVEAWAY_WIN_ROLE_ID)
     for uid in winners:
-        m = interaction.guild.get_member(uid)
+        m = interaction.guild.get_member(uid) if interaction.guild else None
         if m and role:
             try:
                 await m.add_roles(role, reason="Giveaway reroll")
             except Exception:
                 pass
 
+    mentions = ", ".join(f"<@{u}>" for u in winners)
+    extra = f"\nRola {role.mention} nadana." if role else ""
+    note = "\n_(brak nowych osób — wylosowano z puli z poprzednimi zwycięzcami)_" if used_fallback else ""
+    announce = f"🎲 **Reroll!**\nNagroda: **{prize}**\nNowi zwycięzcy: {mentions}{extra}{note}"
+
+    # Ogłoszenie na kanale KONKURSU, nie na kanale komend
+    ch = interaction.guild.get_channel(channel_id) if interaction.guild else None
+    if not ch:
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except Exception:
+            ch = None
+
+    posted = False
+    if ch:
+        try:
+            await ch.send(announce)
+            posted = True
+        except Exception as e:
+            print(f"reroll announce: {e}")
+
     await interaction.response.send_message(
-        f"🎲 **Reroll!** Nagroda: **{prize}**\nNowi zwycięzcy: {mentions}"
+        (f"✅ Reroll wysłany na {ch.mention}\n{mentions}" if posted else f"✅ Reroll (kanał konkursu niedostępny):\n{mentions}"),
+        ephemeral=True,
     )
 
 
