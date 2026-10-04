@@ -43,6 +43,7 @@ TICKET_ARCHIVE_CHANNEL_ID = _env_int("TICKET_ARCHIVE_CHANNEL_ID")
 GIVEAWAY_WIN_ROLE_ID = _env_int("GIVEAWAY_WIN_ROLE_ID")
 SUGGESTION_CHANNEL_ID = _env_int("SUGGESTION_CHANNEL_ID")
 MEMBER_COUNT_CHANNEL_ID = _env_int("MEMBER_COUNT_CHANNEL_ID")  # voice "Gracze: X"
+NSFW_ACCESS_ROLE_ID = _env_int("NSFW_ACCESS_ROLE_ID")  # rola po "Kontynuuj" na bramce 18+
 # Volume na Railway: DB_PATH=/data/moderation.db
 _db = (os.getenv("DB_PATH") or "moderation.db").strip()
 DB_PATH = _db if _db else "moderation.db"
@@ -207,6 +208,11 @@ async def init_db():
             giveaway_id INTEGER,
             user_id INTEGER,
             PRIMARY KEY (giveaway_id, user_id))""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS giveaway_bans (
+            user_id INTEGER PRIMARY KEY,
+            reason TEXT,
+            banned_by INTEGER,
+            timestamp TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS ticket_transcripts (
             ticket_number INTEGER PRIMARY KEY,
             channel_id INTEGER,
@@ -537,6 +543,7 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView())
     bot.add_view(GiveawayView())
+    bot.add_view(AgeGateView())
     bot.loop.create_task(giveaway_watcher())
     bot.loop.create_task(member_count_loop())
     for g in bot.guilds:
@@ -1397,7 +1404,7 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="Temp VC", value="`/tempon` `/tempoff` `/tempmax` `/temptime`", inline=False)
     embed.add_field(name="Tickety", value="`/ticket_setup` `/ticket_close`", inline=False)
     embed.add_field(name="System", value="`/sync`", inline=False)
-    embed.add_field(name="Konkursy", value="`/giveaway` `/giveaway_end` `/giveaway_reroll` `/giveaway_list`", inline=False)
+    embed.add_field(name="Konkursy", value="`/giveaway` `/giveaway_end` `/giveaway_reroll` `/giveaway_list` `/giveaway_ban` `/giveaway_unban` `/giveaway_kick`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -2790,6 +2797,16 @@ class GiveawayJoinButton(discord.ui.Button):
 
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
+                "SELECT reason FROM giveaway_bans WHERE user_id = ?",
+                (interaction.user.id,),
+            )
+            ban = await cur.fetchone()
+            if ban:
+                return await interaction.response.send_message(
+                    f"❌ Masz blokadę konkursów.\nPowód: {ban[0] or 'brak'}",
+                    ephemeral=True,
+                )
+            cur = await db.execute(
                 "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
                 (gid, interaction.user.id),
             )
@@ -3253,6 +3270,176 @@ async def cmd_chat_unrestrict(
 
     await interaction.followup.send(
         f"✅ **{channel.mention}** — slowmode OFF, GIF-y/pliki z powrotem dla @everyone.",
+        ephemeral=True,
+    )
+
+
+
+# ===================== BRAMKA 18+ (kanał, bez ról) =====================
+# Kontynuuj = zostajesz na serwerze (bez nadawania ról)
+# Wróć = kick z serwera
+class AgeGateView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Kontynuuj",
+        style=discord.ButtonStyle.danger,
+        emoji="🔞",
+        custom_id="agegate_continue",
+    )
+    async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "✅ Potwierdzono.\n"
+            "Wchodzisz na **własną odpowiedzialność** — kanał może zawierać treści 18+.\n"
+            "Możesz korzystać z serwera.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Wróć",
+        style=discord.ButtonStyle.secondary,
+        emoji="↩️",
+        custom_id="agegate_back",
+    )
+    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Opuszczasz serwer — nie zaakceptowano ostrzeżenia.",
+            ephemeral=True,
+        )
+        try:
+            await interaction.user.kick(reason="Bramka 18+: Wróć (brak akceptacji)")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Nie mogę wyrzucić (brak uprawnienia Kick albo rola bota za nisko).",
+                ephemeral=True,
+            )
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Kick nieudany: `{e}`", ephemeral=True)
+            except Exception:
+                pass
+
+
+@bot.tree.command(name="agegate_setup", description="Panel 18+ na wybranym kanale (Kontynuuj / Wróć=kick)")
+@app_commands.describe(kanal="Kanał z panelem (domyślnie ten)")
+@is_mod()
+async def cmd_agegate_setup(
+    interaction: discord.Interaction,
+    kanal: Optional[discord.TextChannel] = None,
+):
+    channel = kanal or interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return await interaction.response.send_message("❌ Tylko kanał tekstowy.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="🔞 Ostrzeżenie",
+        description=(
+            "**Wchodzisz na własną odpowiedzialność.**\n"
+            "Ten serwer / kanał **może zawierać treści 18+**.\n\n"
+            "▶ **Kontynuuj** — zostajesz na serwerze\n"
+            "◀ **Wróć** — wychodzisz z serwera (kick)\n\n"
+            "To potwierdzenie przez **bota**, nie weryfikacja wieku Discord."
+        ),
+        color=0xE74C3C,
+    )
+    embed.set_footer(text="18+ • własna odpowiedzialność")
+    await channel.send(embed=embed, view=AgeGateView())
+    await interaction.response.send_message(
+        f"✅ Panel na {channel.mention}\n"
+        f"**Kontynuuj** = zostaje (bez ról)\n"
+        f"**Wróć** = kick z serwera\n\n"
+        f"Bot potrzebuje uprawnienia **Wyrzucanie członków**.",
+        ephemeral=True,
+    )
+
+
+# ===================== GIVEAWAY BAN =====================
+@bot.tree.command(name="giveaway_ban", description="Zablokuj udział w konkursach")
+@app_commands.describe(uzytkownik="Kogo zablokować", powod="Powód")
+@is_mod()
+async def cmd_giveaway_ban(
+    interaction: discord.Interaction,
+    uzytkownik: discord.Member,
+    powod: str = "Blokada konkursów",
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO giveaway_bans (user_id, reason, banned_by, timestamp)
+               VALUES (?, ?, ?, ?)""",
+            (
+                uzytkownik.id,
+                powod,
+                interaction.user.id,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        # wypisz ze wszystkich aktywnych
+        await db.execute(
+            """DELETE FROM giveaway_entries WHERE user_id = ? AND giveaway_id IN (
+                SELECT id FROM giveaways WHERE ended = 0
+            )""",
+            (uzytkownik.id,),
+        )
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"🚫 **{uzytkownik.mention}** nie może brać udziału w konkursach.\nPowód: {powod}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="giveaway_unban", description="Odblokuj udział w konkursach")
+@app_commands.describe(uzytkownik="Kogo odblokować")
+@is_mod()
+async def cmd_giveaway_unban(interaction: discord.Interaction, uzytkownik: discord.Member):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM giveaway_bans WHERE user_id = ?", (uzytkownik.id,))
+        await db.commit()
+    await interaction.response.send_message(
+        f"✅ **{uzytkownik.mention}** znowu może brać udział w konkursach.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="giveaway_kick", description="Wyrzuć z konkretnego konkursu (nie ban)")
+@app_commands.describe(
+    uzytkownik="Kogo wyrzucić",
+    message_id="ID wiadomości konkursu",
+)
+@is_mod()
+async def cmd_giveaway_kick(
+    interaction: discord.Interaction,
+    uzytkownik: discord.Member,
+    message_id: str,
+):
+    try:
+        mid = int(message_id.strip())
+    except ValueError:
+        return await interaction.response.send_message("❌ Złe ID wiadomości.", ephemeral=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, ended FROM giveaways WHERE message_id = ?", (mid,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return await interaction.response.send_message("❌ Nie znaleziono konkursu.", ephemeral=True)
+        gid, ended = row
+        if ended:
+            return await interaction.response.send_message("❌ Konkurs już zakończony.", ephemeral=True)
+        await db.execute(
+            "DELETE FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
+            (gid, uzytkownik.id),
+        )
+        await db.commit()
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
+        )
+        count = (await cur.fetchone())[0]
+
+    await interaction.response.send_message(
+        f"✅ **{uzytkownik.mention}** usunięty z konkursu. Zostało osób: **{count}**",
         ephemeral=True,
     )
 
