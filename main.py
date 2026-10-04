@@ -43,7 +43,6 @@ TICKET_ARCHIVE_CHANNEL_ID = _env_int("TICKET_ARCHIVE_CHANNEL_ID")
 GIVEAWAY_WIN_ROLE_ID = _env_int("GIVEAWAY_WIN_ROLE_ID")
 SUGGESTION_CHANNEL_ID = _env_int("SUGGESTION_CHANNEL_ID")
 MEMBER_COUNT_CHANNEL_ID = _env_int("MEMBER_COUNT_CHANNEL_ID")  # voice "Gracze: X"
-NSFW_ACCESS_ROLE_ID = _env_int("NSFW_ACCESS_ROLE_ID")  # rola po "Kontynuuj" na bramce 18+
 # Volume na Railway: DB_PATH=/data/moderation.db
 _db = (os.getenv("DB_PATH") or "moderation.db").strip()
 DB_PATH = _db if _db else "moderation.db"
@@ -543,7 +542,6 @@ async def on_ready():
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView())
     bot.add_view(GiveawayView())
-    bot.add_view(AgeGateView())
     bot.loop.create_task(giveaway_watcher())
     bot.loop.create_task(member_count_loop())
     for g in bot.guilds:
@@ -3275,85 +3273,6 @@ async def cmd_chat_unrestrict(
 
 
 
-# ===================== BRAMKA 18+ (kanał, bez ról) =====================
-# Kontynuuj = zostajesz na serwerze (bez nadawania ról)
-# Wróć = kick z serwera
-class AgeGateView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Kontynuuj",
-        style=discord.ButtonStyle.danger,
-        emoji="🔞",
-        custom_id="agegate_continue",
-    )
-    async def continue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            "✅ Potwierdzono.\n"
-            "Wchodzisz na **własną odpowiedzialność** — kanał może zawierać treści 18+.\n"
-            "Możesz korzystać z serwera.",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(
-        label="Wróć",
-        style=discord.ButtonStyle.secondary,
-        emoji="↩️",
-        custom_id="agegate_back",
-    )
-    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            "Opuszczasz serwer — nie zaakceptowano ostrzeżenia.",
-            ephemeral=True,
-        )
-        try:
-            await interaction.user.kick(reason="Bramka 18+: Wróć (brak akceptacji)")
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "❌ Nie mogę wyrzucić (brak uprawnienia Kick albo rola bota za nisko).",
-                ephemeral=True,
-            )
-        except Exception as e:
-            try:
-                await interaction.followup.send(f"❌ Kick nieudany: `{e}`", ephemeral=True)
-            except Exception:
-                pass
-
-
-@bot.tree.command(name="agegate_setup", description="Panel 18+ na wybranym kanale (Kontynuuj / Wróć=kick)")
-@app_commands.describe(kanal="Kanał z panelem (domyślnie ten)")
-@is_mod()
-async def cmd_agegate_setup(
-    interaction: discord.Interaction,
-    kanal: Optional[discord.TextChannel] = None,
-):
-    channel = kanal or interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.response.send_message("❌ Tylko kanał tekstowy.", ephemeral=True)
-
-    embed = discord.Embed(
-        title="🔞 Ostrzeżenie",
-        description=(
-            "**Wchodzisz na własną odpowiedzialność.**\n"
-            "Ten serwer / kanał **może zawierać treści 18+**.\n\n"
-            "▶ **Kontynuuj** — zostajesz na serwerze\n"
-            "◀ **Wróć** — wychodzisz z serwera (kick)\n\n"
-            "To potwierdzenie przez **bota**, nie weryfikacja wieku Discord."
-        ),
-        color=0xE74C3C,
-    )
-    embed.set_footer(text="18+ • własna odpowiedzialność")
-    await channel.send(embed=embed, view=AgeGateView())
-    await interaction.response.send_message(
-        f"✅ Panel na {channel.mention}\n"
-        f"**Kontynuuj** = zostaje (bez ról)\n"
-        f"**Wróć** = kick z serwera\n\n"
-        f"Bot potrzebuje uprawnienia **Wyrzucanie członków**.",
-        ephemeral=True,
-    )
-
-
 # ===================== GIVEAWAY BAN =====================
 @bot.tree.command(name="giveaway_ban", description="Zablokuj udział w konkursach")
 @app_commands.describe(uzytkownik="Kogo zablokować", powod="Powód")
@@ -3420,12 +3339,13 @@ async def cmd_giveaway_kick(
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, ended FROM giveaways WHERE message_id = ?", (mid,)
+            "SELECT id, ended, channel_id, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
+            (mid,),
         )
         row = await cur.fetchone()
         if not row:
             return await interaction.response.send_message("❌ Nie znaleziono konkursu.", ephemeral=True)
-        gid, ended = row
+        gid, ended, ch_id, prize, winners_count, end_at, host_id = row
         if ended:
             return await interaction.response.send_message("❌ Konkurs już zakończony.", ephemeral=True)
         await db.execute(
@@ -3437,6 +3357,23 @@ async def cmd_giveaway_kick(
             "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
         )
         count = (await cur.fetchone())[0]
+
+    # Odśwież embed na wiadomości konkursu
+    try:
+        ch = interaction.guild.get_channel(ch_id) or await interaction.guild.fetch_channel(ch_id)
+        msg = await ch.fetch_message(mid)
+        end_dt = datetime.fromisoformat(end_at)
+        host = interaction.guild.get_member(host_id) or interaction.user
+        embed = await _build_giveaway_embed(
+            prize=prize,
+            end_at=end_dt,
+            winners_count=winners_count,
+            participants=count,
+            host=host,
+        )
+        await msg.edit(embed=embed, view=GiveawayView())
+    except Exception as e:
+        print(f"giveaway_kick embed refresh: {e}")
 
     await interaction.response.send_message(
         f"✅ **{uzytkownik.mention}** usunięty z konkursu. Zostało osób: **{count}**",
