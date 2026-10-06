@@ -63,7 +63,6 @@ TICKET_CATEGORIES = [
     {"label": "Odbiór nagrody", "value": "odbior_nagrody", "emoji": "🎁", "desc": "Odbiór nagrody z konkursu / za zaproszenia"},
     {"label": "Pomoc", "value": "pomoc", "emoji": "🆘", "desc": "Potrzebuję pomocy technicznej"},
     {"label": "Współpraca", "value": "wspolpraca", "emoji": "🤝", "desc": "Mam ofertę współpracy"},
-    {"label": "Inne", "value": "inne", "emoji": "❓", "desc": "Inny powód kontaktu"},
 ]
 
 # ===================== BOT =====================
@@ -2617,9 +2616,9 @@ async def cmd_ticket_setup(interaction: discord.Interaction):
             "Wybierz kategorię z menu poniżej, aby otworzyć ticketa.\n\n"
             "**Dostępne kategorie:**\n"
             "🛒 **Zakup** — produkt / usługa\n"
+            "🎁 **Odbiór nagrody** — konkurs / zaproszenia\n"
             "🆘 **Pomoc** — wsparcie techniczne\n"
-            "🤝 **Współpraca** — oferty partnerskie\n"
-            "❓ **Inne** — pozostałe sprawy"
+            "🤝 **Współpraca** — oferty partnerskie"
         ),
         color=0x5865F2,
     )
