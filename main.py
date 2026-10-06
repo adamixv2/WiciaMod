@@ -63,6 +63,7 @@ TICKET_CATEGORIES = [
     {"label": "Odbiór nagrody", "value": "odbior_nagrody", "emoji": "🎁", "desc": "Odbiór nagrody z konkursu / za zaproszenia"},
     {"label": "Pomoc", "value": "pomoc", "emoji": "🆘", "desc": "Potrzebuję pomocy technicznej"},
     {"label": "Współpraca", "value": "wspolpraca", "emoji": "🤝", "desc": "Mam ofertę współpracy"},
+    {"label": "Inne", "value": "inne", "emoji": "❓", "desc": "Inny powód kontaktu"},
 ]
 
 # ===================== BOT =====================
