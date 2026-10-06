@@ -60,6 +60,7 @@ TEMP_DELETE_SECONDS = 30
 # Kategorie ticketów (label, value, emoji, opis w select)
 TICKET_CATEGORIES = [
     {"label": "Zakup", "value": "zakup", "emoji": "🛒", "desc": "Chcę kupić produkt/usługę"},
+    {"label": "Odbiór nagrody", "value": "odbior_nagrody", "emoji": "🎁", "desc": "Odbiór nagrody z konkursu / za zaproszenia"},
     {"label": "Pomoc", "value": "pomoc", "emoji": "🆘", "desc": "Potrzebuję pomocy technicznej"},
     {"label": "Współpraca", "value": "wspolpraca", "emoji": "🤝", "desc": "Mam ofertę współpracy"},
     {"label": "Inne", "value": "inne", "emoji": "❓", "desc": "Inny powód kontaktu"},
