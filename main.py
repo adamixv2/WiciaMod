@@ -1927,12 +1927,25 @@ async def _collect_ticket_messages(channel: discord.TextChannel):
     return messages
 
 
-async def _human_messages_only(messages):
-    """Ludzie z historii Discord; jeśli pusto — z bazy ticket_messages."""
-    out = []
-    seen = set()
-    for msg in messages:
-        if msg.author.bot:
+async def _humans_from_db(channel_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """SELECT author_name, content, message_id FROM ticket_messages
+               WHERE channel_id = ? AND is_bot = 0 AND content != ''
+               ORDER BY id ASC""",
+            (channel_id,),
+        )
+        rows = await cur.fetchall()
+    return [{"author": r[0], "content": r[1], "mid": r[2]} for r in rows]
+
+
+async def _human_messages_only(messages, channel_id: int = None):
+    """Historia Discord + baza — scalone, bez duplikatów."""
+    by_mid = {}
+    order = []
+
+    for msg in messages or []:
+        if getattr(msg.author, "bot", False):
             continue
         content = (msg.content or "").strip()
         if msg.attachments:
@@ -1940,42 +1953,29 @@ async def _human_messages_only(messages):
             content = (content + f" [pliki: {atts}]").strip()
         if not content:
             continue
-        key = msg.id
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"author": str(msg.author.display_name), "content": content, "mid": msg.id})
+        mid = msg.id
+        if mid not in by_mid:
+            order.append(mid)
+        by_mid[mid] = {"author": str(msg.author.display_name), "content": content, "mid": mid}
 
-    if out:
-        return [{"author": h["author"], "content": h["content"]} for h in out]
+    ch_id = channel_id
+    if ch_id is None and messages:
+        try:
+            ch_id = messages[0].channel.id
+        except Exception:
+            ch_id = None
+    if ch_id:
+        try:
+            for h in await _humans_from_db(ch_id):
+                mid = h.get("mid") or f"db-{h['author']}-{h['content'][:40]}"
+                if mid in by_mid:
+                    continue
+                order.append(mid)
+                by_mid[mid] = h
+        except Exception as e:
+            print(f"merge db humans: {e}")
 
-    # Fallback: log z bazy
-    try:
-        ch_id = messages[0].channel.id if messages else None
-        if not ch_id:
-            return out
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                """SELECT author_name, content FROM ticket_messages
-                   WHERE channel_id = ? AND is_bot = 0 AND content != ''
-                   ORDER BY id ASC""",
-                (ch_id,),
-            )
-            rows = await cur.fetchall()
-        return [{"author": r[0], "content": r[1]} for r in rows]
-    except Exception:
-        return out
-
-
-async def _humans_from_db(channel_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """SELECT author_name, content FROM ticket_messages
-               WHERE channel_id = ? AND is_bot = 0 AND content != ''
-               ORDER BY id ASC""",
-            (channel_id,),
-        )
-        return [{"author": r[0], "content": r[1]} for r in await cur.fetchall()]
+    return [{"author": by_mid[m]["author"], "content": by_mid[m]["content"]} for m in order]
 
 
 async def _build_transcript_txt(
@@ -2095,17 +2095,7 @@ async def _close_ticket(
 
     # Najpierw zbierz historię (i dociągnij do logu), potem buduj transcript
     messages = await _collect_ticket_messages(channel)
-    humans = await _human_messages_only(messages)
-    if not humans:
-        humans = await _humans_from_db(channel.id)
-
-    # Zawsze preferuj pełniejszy log z bazy, jeśli ma więcej wpisów
-    try:
-        db_humans = await _humans_from_db(channel.id)
-        if len(db_humans) > len(humans):
-            humans = db_humans
-    except Exception:
-        pass
+    humans = await _human_messages_only(messages, channel_id=channel.id)
 
     txt_bytes = await _build_transcript_txt(
         messages,
@@ -2230,76 +2220,85 @@ async def _close_ticket(
 
 
 async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
-    # Unikaj podwójnej odpowiedzi (View + listen)
-    if interaction.response.is_done():
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT content_txt FROM ticket_transcripts WHERE ticket_number = ?",
-            (tnum,),
-        )
-        row = await cur.fetchone()
-    if not row or not row[0]:
-        try:
-            return await interaction.response.send_message(
-                "❌ Przebieg niedostępny (wygasł lub usunięty).", ephemeral=True
-            )
-        except Exception:
-            return
-    raw = row[0]
-    embeds = []
-    colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245, 0x00D4FF]
-    blocks = []
-    current_author = None
-    current_lines = []
-    skip_prefixes = ("===", "---", "Serwer:", "Kategoria:", "Powod", "Zamkniety", "Powód")
-    for line in raw.splitlines():
-        if any(line.startswith(p) for p in skip_prefixes) or not line.strip():
-            if line.startswith("  ") and current_author is not None:
-                current_lines.append(line.strip())
-            continue
-        if line.endswith(":") and not line.startswith(" "):
-            if current_author and current_lines:
-                blocks.append((current_author, "\n".join(current_lines)))
-            current_author = line[:-1].strip()
-            current_lines = []
-        elif line.startswith("  ") and current_author is not None:
-            current_lines.append(line.strip())
-        elif current_author is not None and line.strip():
-            current_lines.append(line.strip())
-    if current_author and current_lines:
-        blocks.append((current_author, "\n".join(current_lines)))
-
+    """Pełny przebieg na PV / ephemeral — zawsze jako plik TXT (bez limitu 10 embedów)."""
     try:
-        if not blocks:
-            embed = discord.Embed(
-                title="📄 Przebieg rozmowy",
-                description=(raw[:4000] if raw else "Brak wiadomości."),
-                color=0x5865F2,
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT content_txt FROM ticket_transcripts WHERE ticket_number = ?",
+                (tnum,),
             )
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            if interaction.response.is_done():
+                return await interaction.followup.send("❌ Brak zapisanego przebiegu.", ephemeral=True)
+            return await interaction.response.send_message("❌ Brak zapisanego przebiegu.", ephemeral=True)
 
-        # Kolor stały per gracz w ramach ticketa; inny ticket = inna paleta
-        author_color = {}
-        for author, content in blocks[:20]:
-            if author not in author_color:
-                # hash(nick + nr ticketa) → inny kolor w każdym tickecie
-                h = sum(ord(c) for c in f"{author}:{tnum}")
-                author_color[author] = colors[h % len(colors)]
-            emb = discord.Embed(
-                description=f"**{author}**\n{content[:1000]}",
-                color=author_color[author],
+        raw = row[0]
+        # Plik z CAŁYM przebiegiem
+        data = raw.encode("utf-8", errors="replace")
+        file = discord.File(fp=io.BytesIO(data), filename=f"ticket-{tnum}-przebieg.txt")
+
+        # Podgląd: max 5 pierwszych wiadomości użytkowników (embed)
+        blocks = []
+        lines = raw.splitlines()
+        i = 0
+        while i < len(lines) and len(blocks) < 5:
+            line = lines[i].rstrip()
+            if line.endswith(":") and not line.startswith("=") and not line.startswith("-"):
+                author = line[:-1].strip()
+                body_lines = []
+                i += 1
+                while i < len(lines) and lines[i].startswith("  "):
+                    body_lines.append(lines[i].strip())
+                    i += 1
+                body = "\n".join(body_lines).strip()
+                if author and body:
+                    blocks.append((author, body))
+                continue
+            i += 1
+
+        embeds = []
+        colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245]
+        for idx, (author, content) in enumerate(blocks):
+            embeds.append(
+                discord.Embed(
+                    description=f"**{author}**\n{content[:900]}",
+                    color=colors[idx % len(colors)],
+                )
             )
-            embeds.append(emb)
 
-        await interaction.response.send_message(
-            content="📄 **Przebieg rozmowy** (tylko wiadomości użytkowników):",
-            embeds=embeds[:10],
-            ephemeral=True,
+        total_msgs = raw.count("\n  ")  # przybliżenie
+        header = (
+            f"📄 **Pełny przebieg ticketa #{tnum}**\n"
+            f"W załączniku jest **cała** rozmowa (TXT).\n"
+            f"Poniżej krótki podgląd (max 5 wiadomości)."
         )
-    except discord.HTTPException:
-        # Interaction already acknowledged — ignoruj
+
+        kwargs = {
+            "content": header,
+            "file": file,
+            "ephemeral": True,
+        }
+        if embeds:
+            kwargs["embeds"] = embeds
+
+        if interaction.response.is_done():
+            await interaction.followup.send(**kwargs)
+        else:
+            await interaction.response.send_message(**kwargs)
+    except discord.HTTPException as e:
+        print(f"transcript send HTTP: {e}")
         return
+    except Exception as e:
+        print(f"transcript send: {e}")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ Błąd: `{e}`", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ Błąd: `{e}`", ephemeral=True)
+        except Exception:
+            pass
+
 
 
 class TicketTranscriptView(discord.ui.View):
@@ -3288,6 +3287,52 @@ async def cmd_giveaway_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class SyncCommandsView(discord.ui.View):
+    """Przyciski: Wszystkie / Mniej / Zamknij — lista komend po /sync."""
+
+    def __init__(self, names: list, user_id: int):
+        super().__init__(timeout=120)
+        self.names = names
+        self.user_id = user_id
+        self.expanded = False
+
+    def _text(self) -> str:
+        n = len(self.names)
+        if self.expanded:
+            lista = ", ".join(f"`/{x}`" for x in self.names)
+            if len(lista) > 1800:
+                lista = ", ".join(f"`/{x}`" for x in self.names[:55]) + f"\n... +{n - 55}"
+        else:
+            lista = ", ".join(f"`/{x}`" for x in self.names[:20])
+            if n > 20:
+                lista += f"\n... +{n - 20}"
+        return (
+            f"✅ **Komendy odświeżone** — **{n}** (bez duplikatów).\n\n"
+            f"{lista}\n\nOdśwież listę w Discordzie: **Ctrl+R**"
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ To nie Twoja lista.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Wszystkie", style=discord.ButtonStyle.primary, emoji="📋")
+    async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.expanded = True
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    @discord.ui.button(label="Mniej", style=discord.ButtonStyle.secondary, emoji="📎")
+    async def btn_less(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.expanded = False
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    @discord.ui.button(label="Zamknij", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ Zamknięte.", view=None)
+        self.stop()
+
+
 @bot.tree.command(name="sync", description="Odśwież komendy bota (usuwa duplikaty)")
 @is_mod()
 async def cmd_sync(interaction: discord.Interaction):
@@ -3300,11 +3345,9 @@ async def cmd_sync(interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.followup.send("❌ Użyj /sync na serwerze.", ephemeral=True)
 
-        # 1) Komendy na ten serwer (szybko)
         bot.tree.copy_global_to(guild=interaction.guild)
         synced = await bot.tree.sync(guild=interaction.guild)
 
-        # 2) Usuń GLOBALNE — bez tego Discord pokazuje każdą komendę 2x
         try:
             if bot.application_id:
                 await bot.http.bulk_upsert_global_commands(bot.application_id, [])
@@ -3312,13 +3355,8 @@ async def cmd_sync(interaction: discord.Interaction):
             print(f"clear global: {ge}")
 
         names = sorted(c.name for c in synced)
-        lista = ", ".join(f"`/{n}`" for n in names[:35])
-        more = f"\n... +{len(names) - 35}" if len(names) > 35 else ""
-        await interaction.followup.send(
-            f"✅ **Gotowe w kilka sekund** — **{len(synced)}** komend (bez duplikatów).\n\n"
-            f"{lista}{more}\n\nOdśwież Discord: **Ctrl+R**",
-            ephemeral=True,
-        )
+        view = SyncCommandsView(names, interaction.user.id)
+        await interaction.followup.send(content=view._text(), view=view, ephemeral=True)
         print(f"✅ /sync OK: {len(synced)} komend")
     except Exception as e:
         print(f"❌ /sync error: {e}")
