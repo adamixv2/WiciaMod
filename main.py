@@ -1370,18 +1370,29 @@ class LegitMethodSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         choice = self.values[0]
+        old_msg = interaction.message
         if choice == "blik":
             await interaction.response.send_message(
                 "BLIK — wybierz wariant:",
                 view=LegitSubView("blik", self.anonim, self.user, self.amount),
                 ephemeral=True,
             )
+            try:
+                if old_msg:
+                    await old_msg.delete()
+            except Exception:
+                pass
         elif choice == "psc":
             await interaction.response.send_message(
                 "PSC — wybierz wariant:",
                 view=LegitSubView("psc", self.anonim, self.user, self.amount),
                 ephemeral=True,
             )
+            try:
+                if old_msg:
+                    await old_msg.delete()
+            except Exception:
+                pass
         elif choice == "zaproszenia":
             await _finish_legit(
                 interaction,
@@ -1391,6 +1402,7 @@ class LegitMethodSelect(discord.ui.Select):
                 method="ZAPROSZENIA",
             )
         else:
+            # Modal — nie da się usunąć wiadomości w tym samym response, sprzątamy w finish
             await interaction.response.send_modal(
                 LegitInneModal(self.anonim, self.user, self.amount)
             )
@@ -1410,14 +1422,29 @@ class LegitAnonimView(discord.ui.View):
     @discord.ui.button(label="Anonim", style=discord.ButtonStyle.secondary, emoji="🕵️")
     async def anonim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user.id:
-            return await interaction.response.send_message("❌ To nie Twoja legita.", ephemeral=True)
+            return await interaction.response.send_message("❌ To nie Twoja legitka.", ephemeral=True)
         await interaction.response.send_modal(LegitAmountModal(anonim=True, user=self.user))
 
     @discord.ui.button(label="Pokaż mnie", style=discord.ButtonStyle.primary, emoji="👤")
     async def show_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user.id:
-            return await interaction.response.send_message("❌ To nie Twoja legita.", ephemeral=True)
+            return await interaction.response.send_message("❌ To nie Twoja legitka.", ephemeral=True)
         await interaction.response.send_modal(LegitAmountModal(anonim=False, user=self.user))
+
+
+async def _cleanup_ephemeral(interaction: discord.Interaction):
+    """Usuwa wiadomości 'tylko dla Ciebie' z flow legity (selecty / potwierdzenia)."""
+    # Wiadomość z przyciskami/selectem (jeśli callback z komponentu)
+    try:
+        if interaction.message:
+            await interaction.message.delete()
+    except Exception:
+        pass
+    # Oryginalna odpowiedź tej interakcji (jeśli była)
+    try:
+        await interaction.delete_original_response()
+    except Exception:
+        pass
 
 
 async def _finish_legit(
@@ -1449,8 +1476,17 @@ async def _finish_legit(
         buyer_mention = user.mention
 
     try:
+        # Najpierw acknowledge interakcję (3s limit Discorda)
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
+
+        # Usuń wiadomość z selectem / przyciskami (tylko dla Ciebie)
+        try:
+            if interaction.message:
+                await interaction.message.delete()
+        except Exception:
+            pass
+
         await post_legit_embed(
             channel,
             buyer_text=buyer_text,
@@ -1458,13 +1494,23 @@ async def _finish_legit(
             method=method,
             buyer_mention=buyer_mention,
         )
-        await interaction.followup.send(
-            f"✅ Legita dodana na {channel.mention}\n"
-            f"**Kwota:** {amount if amount.upper().endswith('PLN') else amount + ' PLN'}\n"
-            f"**Metoda:** {method}\n"
-            f"**Kupujący:** {'Anonim' if anonim else user.mention}",
+
+        # Krótki toast tylko dla Ciebie → auto-usunięcie po 4s
+        amount_txt = amount if amount.upper().endswith("PLN") else f"{amount} PLN"
+        toast = await interaction.followup.send(
+            f"✅ **Legitka dodana** na {channel.mention}\n"
+            f"{amount_txt} · {method} · {'Anonim' if anonim else user.mention}",
             ephemeral=True,
         )
+
+        async def _delete_toast():
+            await asyncio.sleep(4)
+            try:
+                await toast.delete()
+            except Exception:
+                pass
+
+        asyncio.create_task(_delete_toast())
     except Exception as e:
         print(f"[legit] błąd post: {e}")
         try:
@@ -1473,7 +1519,7 @@ async def _finish_legit(
             pass
 
 
-@bot.tree.command(name="legit", description="Dodaj legita (transakcja)")
+@bot.tree.command(name="legit", description="Dodaj legitkę (transakcja)")
 async def cmd_legit(interaction: discord.Interaction):
     if not LEGIT_CHANNEL_ID:
         return await interaction.response.send_message(
@@ -1482,9 +1528,9 @@ async def cmd_legit(interaction: discord.Interaction):
         )
     view = LegitAnonimView(interaction.user)
     await interaction.response.send_message(
-        "**Nowa legita** — czy chcesz być anonimowy?\n"
-        "🕵️ **Anonim** — nie pokaże Cię na legicie\n"
-        "👤 **Pokaż mnie** — oznaczy Cię na legicie",
+        "**Nowa legitka** — czy chcesz być anonimowy?\n"
+        "🕵️ **Anonim** — nie pokaże Cię na legitce\n"
+        "👤 **Pokaż mnie** — oznaczy Cię na legitce",
         view=view,
         ephemeral=True,
     )
