@@ -460,6 +460,17 @@ async def update_legit_channel_name(channel: discord.TextChannel = None, *, delt
         print(f"[legit] błąd zmiany nazwy: {e}")
 
 
+def _normalize_logo_url(url: str) -> str:
+    """Czyści URL logo — linki Discord z ?ex=&hm= wygasają, bierzemy bazowy URL."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    # Discord CDN signed links wygasają — odetnij query string
+    if "cdn.discordapp.com" in url or "media.discordapp.net" in url:
+        url = url.split("?")[0]
+    return url
+
+
 async def post_legit_embed(
     channel: discord.TextChannel,
     *,
@@ -477,11 +488,34 @@ async def post_legit_embed(
     embed.add_field(name="👤 Kupujący", value=buyer_text, inline=False)
     embed.add_field(name="💰 Kwota", value=amount_clean, inline=True)
     embed.add_field(name="🏷 Metoda", value=method, inline=True)
-    if LEGIT_LOGO_URL:
-        embed.set_thumbnail(url=LEGIT_LOGO_URL)
+
+    logo = _normalize_logo_url(LEGIT_LOGO_URL)
+    if logo:
+        # thumbnail = małe po prawej (jak w shopie); image = duże pod spodem
+        embed.set_thumbnail(url=logo)
 
     content = buyer_mention if buyer_mention else None
     return await channel.send(content=content, embed=embed)
+
+
+# Śledzenie wiadomości ephemeral w flow /legit (żeby je posprzątać na końcu)
+_legit_flow_msgs: dict[int, list] = {}
+
+
+def _legit_track(user_id: int, msg):
+    if msg is None:
+        return
+    _legit_flow_msgs.setdefault(user_id, []).append(msg)
+
+
+async def _legit_clear_flow(user_id: int):
+    """Usuwa wszystkie wiadomości 'tylko dla Ciebie' z flow legity tego usera."""
+    msgs = _legit_flow_msgs.pop(user_id, [])
+    for m in msgs:
+        try:
+            await m.delete()
+        except Exception:
+            pass
 
 
 async def _legit_startup_count():
@@ -1290,6 +1324,11 @@ class LegitAmountModal(discord.ui.Modal, title="Kwota transakcji"):
             view=view,
             ephemeral=True,
         )
+        try:
+            msg = await interaction.original_response()
+            _legit_track(interaction.user.id, msg)
+        except Exception:
+            pass
 
 
 class LegitInneModal(discord.ui.Modal, title="Inna metoda"):
@@ -1370,29 +1409,17 @@ class LegitMethodSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         choice = self.values[0]
-        old_msg = interaction.message
+        # Edytuj TĘ SAMĄ wiadomość zamiast tworzyć nowe (żeby nie stackować ephemeral)
         if choice == "blik":
-            await interaction.response.send_message(
-                "BLIK — wybierz wariant:",
+            await interaction.response.edit_message(
+                content="BLIK — wybierz wariant:",
                 view=LegitSubView("blik", self.anonim, self.user, self.amount),
-                ephemeral=True,
             )
-            try:
-                if old_msg:
-                    await old_msg.delete()
-            except Exception:
-                pass
         elif choice == "psc":
-            await interaction.response.send_message(
-                "PSC — wybierz wariant:",
+            await interaction.response.edit_message(
+                content="PSC — wybierz wariant:",
                 view=LegitSubView("psc", self.anonim, self.user, self.amount),
-                ephemeral=True,
             )
-            try:
-                if old_msg:
-                    await old_msg.delete()
-            except Exception:
-                pass
         elif choice == "zaproszenia":
             await _finish_legit(
                 interaction,
@@ -1402,7 +1429,6 @@ class LegitMethodSelect(discord.ui.Select):
                 method="ZAPROSZENIA",
             )
         else:
-            # Modal — nie da się usunąć wiadomości w tym samym response, sprzątamy w finish
             await interaction.response.send_modal(
                 LegitInneModal(self.anonim, self.user, self.amount)
             )
@@ -1430,21 +1456,6 @@ class LegitAnonimView(discord.ui.View):
         if interaction.user.id != self.user.id:
             return await interaction.response.send_message("❌ To nie Twoja legitka.", ephemeral=True)
         await interaction.response.send_modal(LegitAmountModal(anonim=False, user=self.user))
-
-
-async def _cleanup_ephemeral(interaction: discord.Interaction):
-    """Usuwa wiadomości 'tylko dla Ciebie' z flow legity (selecty / potwierdzenia)."""
-    # Wiadomość z przyciskami/selectem (jeśli callback z komponentu)
-    try:
-        if interaction.message:
-            await interaction.message.delete()
-    except Exception:
-        pass
-    # Oryginalna odpowiedź tej interakcji (jeśli była)
-    try:
-        await interaction.delete_original_response()
-    except Exception:
-        pass
 
 
 async def _finish_legit(
@@ -1476,16 +1487,18 @@ async def _finish_legit(
         buyer_mention = user.mention
 
     try:
-        # Najpierw acknowledge interakcję (3s limit Discorda)
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
-        # Usuń wiadomość z selectem / przyciskami (tylko dla Ciebie)
+        # 1) Usuń aktualną wiadomość z selectem
         try:
             if interaction.message:
                 await interaction.message.delete()
         except Exception:
             pass
+
+        # 2) Usuń WSZYSTKIE wcześniejsze wiadomości flow (Anonim, metoda itd.)
+        await _legit_clear_flow(user.id)
 
         await post_legit_embed(
             channel,
@@ -1495,7 +1508,7 @@ async def _finish_legit(
             buyer_mention=buyer_mention,
         )
 
-        # Krótki toast tylko dla Ciebie → auto-usunięcie po 4s
+        # Krótki toast → znika po 4s
         amount_txt = amount if amount.upper().endswith("PLN") else f"{amount} PLN"
         toast = await interaction.followup.send(
             f"✅ **Legitka dodana** na {channel.mention}\n"
@@ -1526,6 +1539,9 @@ async def cmd_legit(interaction: discord.Interaction):
             "❌ System legitek nie jest skonfigurowany (brak LEGIT_CHANNEL_ID).",
             ephemeral=True,
         )
+    # Wyczyść ewentualny stary flow
+    await _legit_clear_flow(interaction.user.id)
+
     view = LegitAnonimView(interaction.user)
     await interaction.response.send_message(
         "**Nowa legitka** — czy chcesz być anonimowy?\n"
@@ -1534,6 +1550,11 @@ async def cmd_legit(interaction: discord.Interaction):
         view=view,
         ephemeral=True,
     )
+    try:
+        msg = await interaction.original_response()
+        _legit_track(interaction.user.id, msg)
+    except Exception:
+        pass
 
 
 @bot.tree.command(name="legit_refresh", description="Przelicz licznik legitek i zaktualizuj nazwę kanału")
