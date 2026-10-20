@@ -13,54 +13,35 @@ from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 
 # ===================== KONFIG =====================
-def _env_int(name: str, default: int = 0) -> int:
-    """Bezpieczny int z env — puste '' na Railway nie crashuje bota."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    raw = str(raw).strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"⚠ Zła wartość {name}={raw!r} — używam {default}")
-        return default
-
-
 TOKEN = os.getenv("TOKEN")
-LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID")
-MOD_ROLE_ID = _env_int("MOD_ROLE_ID")
-WELCOME_CHANNEL_ID = _env_int("WELCOME_CHANNEL_ID")
-GOODBYE_CHANNEL_ID = _env_int("GOODBYE_CHANNEL_ID")
-VERIFIED_ROLE_ID = _env_int("VERIFIED_ROLE_ID")
-TEMP_HUB_CHANNEL_ID = _env_int("TEMP_HUB_CHANNEL_ID")
-TEMP_CATEGORY_ID = _env_int("TEMP_CATEGORY_ID")
-INVITE_LOG_CHANNEL_ID = _env_int("INVITE_LOG_CHANNEL_ID")
-TICKET_CATEGORY_ID = _env_int("TICKET_CATEGORY_ID")
-TICKET_STAFF_ROLE_ID = _env_int("TICKET_STAFF_ROLE_ID")  # 0 → MOD_ROLE_ID
-TICKET_ARCHIVE_CHANNEL_ID = _env_int("TICKET_ARCHIVE_CHANNEL_ID")
-GIVEAWAY_WIN_ROLE_ID = _env_int("GIVEAWAY_WIN_ROLE_ID")
-SUGGESTION_CHANNEL_ID = _env_int("SUGGESTION_CHANNEL_ID")
-MEMBER_COUNT_CHANNEL_ID = _env_int("MEMBER_COUNT_CHANNEL_ID")  # voice "Gracze: X"
-# Volume na Railway: DB_PATH=/data/moderation.db
-_db = (os.getenv("DB_PATH") or "moderation.db").strip()
-DB_PATH = _db if _db else "moderation.db"
-MEMBER_COUNT_EXCLUDE = {
-    1552375756871700673,
-    1042355571178868847,
-    1350037082273480735,
-}
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+MOD_ROLE_ID = int(os.getenv("MOD_ROLE_ID", "0"))
+WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
+GOODBYE_CHANNEL_ID = int(os.getenv("GOODBYE_CHANNEL_ID", "0"))
+VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0"))
+TEMP_HUB_CHANNEL_ID = int(os.getenv("TEMP_HUB_CHANNEL_ID", "0"))
+TEMP_CATEGORY_ID = int(os.getenv("TEMP_CATEGORY_ID", "0"))
+INVITE_LOG_CHANNEL_ID = int(os.getenv("INVITE_LOG_CHANNEL_ID", "0"))
+TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
+TICKET_STAFF_ROLE_ID = int(os.getenv("TICKET_STAFF_ROLE_ID", "0"))  # jeśli 0 → używa MOD_ROLE_ID
+TICKET_ARCHIVE_CHANNEL_ID = int(os.getenv("TICKET_ARCHIVE_CHANNEL_ID", "0"))  # archiwum dla adminów
+GIVEAWAY_WIN_ROLE_ID = int(os.getenv("GIVEAWAY_WIN_ROLE_ID", "0"))  # rola dla zwycięzców (np. Klient)
+SUGGESTION_CHANNEL_ID = int(os.getenv("SUGGESTION_CHANNEL_ID", "0"))  # kanał propozycji
+LEGIT_CHANNEL_ID = int(os.getenv("LEGIT_CHANNEL_ID", "0"))  # kanał z legitkami (nazwa auto)
+LEGIT_LOGO_URL = os.getenv("LEGIT_LOGO_URL", "")  # opcjonalny obrazek WICIA w embedzie
+# ID osób których wiadomości NIE liczą się do licznika (np. właściciel) — oddzielone przecinkiem
+_legit_ignore_raw = os.getenv("LEGIT_IGNORE_IDS", "")
+LEGIT_IGNORE_IDS = {int(x.strip()) for x in _legit_ignore_raw.split(",") if x.strip().isdigit()}
 
 SERVER_NAME = "WiciaClient20PLN"
 TEMP_ENABLED = True
 TEMP_MAX_CHANNELS = 3
 TEMP_DELETE_SECONDS = 30
+legit_count_cache = 0  # cache liczby legitek
 
 # Kategorie ticketów (label, value, emoji, opis w select)
 TICKET_CATEGORIES = [
     {"label": "Zakup", "value": "zakup", "emoji": "🛒", "desc": "Chcę kupić produkt/usługę"},
-    {"label": "Odbiór nagrody", "value": "odbior_nagrody", "emoji": "🎁", "desc": "Odbiór nagrody z konkursu / za zaproszenia"},
     {"label": "Pomoc", "value": "pomoc", "emoji": "🆘", "desc": "Potrzebuję pomocy technicznej"},
     {"label": "Współpraca", "value": "wspolpraca", "emoji": "🤝", "desc": "Mam ofertę współpracy"},
     {"label": "Inne", "value": "inne", "emoji": "❓", "desc": "Inny powód kontaktu"},
@@ -139,15 +120,7 @@ def format_time_human(td: timedelta) -> str:
 
 
 async def init_db():
-    # Utwórz folder bazy (np. /data na Railway volume)
-    try:
-        parent = os.path.dirname(DB_PATH)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-    except Exception as e:
-        print(f"DB path mkdir: {e}")
-    print(f"📂 Baza danych: {DB_PATH}")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS warnings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER, moderator_id INTEGER, reason TEXT, timestamp TEXT)""")
@@ -208,38 +181,17 @@ async def init_db():
             giveaway_id INTEGER,
             user_id INTEGER,
             PRIMARY KEY (giveaway_id, user_id))""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS giveaway_bans (
-            user_id INTEGER PRIMARY KEY,
-            reason TEXT,
-            banned_by INTEGER,
-            timestamp TEXT)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS giveaway_winners (
-            giveaway_id INTEGER,
-            user_id INTEGER,
-            PRIMARY KEY (giveaway_id, user_id))""")
         await db.execute("""CREATE TABLE IF NOT EXISTS ticket_transcripts (
             ticket_number INTEGER PRIMARY KEY,
             channel_id INTEGER,
             content_txt TEXT,
             created_at TEXT)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS ticket_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id INTEGER,
-            message_id INTEGER UNIQUE,
-            author_id INTEGER,
-            author_name TEXT,
-            content TEXT,
-            is_bot INTEGER DEFAULT 0,
-            created_at TEXT)""")
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ticket_msgs_ch ON ticket_messages(channel_id)"
-        )
         await db.commit()
 
 
 async def get_active_invite_count(inviter_id: int) -> int:
     """Liczba aktywnych zaproszeń (osoby nadal na serwerze są w bazie)."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM invites WHERE inviter_id = ?",
             (inviter_id,),
@@ -250,7 +202,7 @@ async def get_active_invite_count(inviter_id: int) -> int:
 
 async def remove_invite_for_member(member_id: int) -> Optional[int]:
     """Usuwa zaproszenie przy wyjściu. Zwraca inviter_id albo None."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT inviter_id FROM invites WHERE invited_id = ?",
             (member_id,),
@@ -420,7 +372,7 @@ async def create_welcome_card(member: discord.Member) -> discord.File:
 
 
 async def get_economy(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT credits, last_daily, rep, last_rep, title, text_xp, voice_xp FROM economy WHERE user_id = ?",
             (user_id,),
@@ -434,7 +386,7 @@ async def get_economy(user_id: int):
 
 
 async def set_economy(user_id: int, **kwargs):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         await db.execute("INSERT OR IGNORE INTO economy (user_id) VALUES (?)", (user_id,))
         for k, v in kwargs.items():
             await db.execute(f"UPDATE economy SET {k} = ? WHERE user_id = ?", (v, user_id))
@@ -442,7 +394,7 @@ async def set_economy(user_id: int, **kwargs):
 
 
 async def get_points(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute("SELECT points FROM points WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
         if not row:
@@ -453,7 +405,7 @@ async def get_points(user_id: int) -> int:
 
 
 async def set_points(user_id: int, amount: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         await db.execute(
             "INSERT OR REPLACE INTO points (user_id, points) VALUES (?, ?)",
             (user_id, max(0, amount)),
@@ -469,84 +421,73 @@ def level_to_xp(level: int) -> int:
     return (level - 1) ** 2 * 100
 
 
-
-# ===================== LICZNIK GRACZY (kanał voice) =====================
-_member_count_lock = asyncio.Lock()
-_last_member_count_name = {}
-_last_member_count_edit_at = {}  # channel_id -> monotonic time
-_member_count_dirty = set()  # guild ids do odświeżenia
-_MC_MIN_INTERVAL = 180  # min. 3 min między rename (Discord mocno limituje)
-
-
-def count_real_members(guild: discord.Guild) -> int:
-    n = 0
-    for m in guild.members:
-        if m.bot:
-            continue
-        if m.id in MEMBER_COUNT_EXCLUDE:
-            continue
-        n += 1
-    return n
+# ===================== LEGIT HELPERY =====================
+async def count_legit_messages(channel: discord.TextChannel) -> int:
+    """Liczy wiadomości na kanale legitek, pomija obce boty i LEGIT_IGNORE_IDS."""
+    count = 0
+    try:
+        async for msg in channel.history(limit=None):
+            if msg.author.bot and msg.author.id != bot.user.id:
+                continue
+            if msg.author.id in LEGIT_IGNORE_IDS:
+                continue
+            count += 1
+    except Exception as e:
+        print(f"[legit] błąd liczenia: {e}")
+    return count
 
 
-def mark_member_count_dirty(guild: discord.Guild):
-    if MEMBER_COUNT_CHANNEL_ID and guild:
-        _member_count_dirty.add(guild.id)
-
-
-async def update_member_count_channel(guild: discord.Guild, *, force: bool = False):
-    if not MEMBER_COUNT_CHANNEL_ID:
+async def update_legit_channel_name(channel: discord.TextChannel = None, *, delta: int = None):
+    """Aktualizuje nazwę kanału legitek: ✅legit-check✅➔N"""
+    global legit_count_cache
+    if not LEGIT_CHANNEL_ID:
         return
-    ch = guild.get_channel(MEMBER_COUNT_CHANNEL_ID) or bot.get_channel(MEMBER_COUNT_CHANNEL_ID)
-    if not ch:
+    ch = channel or bot.get_channel(LEGIT_CHANNEL_ID)
+    if not ch or not isinstance(ch, discord.TextChannel):
         return
-    count = count_real_members(guild)
-    new_name = f"👥 Gracze: {count}"
-    if ch.name == new_name or _last_member_count_name.get(ch.id) == new_name:
-        _last_member_count_name[ch.id] = new_name
-        _member_count_dirty.discard(guild.id)
-        return
-
-    import time as _time
-    now = _time.monotonic()
-    last = _last_member_count_edit_at.get(ch.id, 0)
-    if not force and (now - last) < _MC_MIN_INTERVAL:
-        _member_count_dirty.add(guild.id)
-        return
-
-    async with _member_count_lock:
-        now = _time.monotonic()
-        last = _last_member_count_edit_at.get(ch.id, 0)
-        if not force and (now - last) < _MC_MIN_INTERVAL:
-            _member_count_dirty.add(guild.id)
-            return
-        try:
-            await ch.edit(name=new_name, reason="Liczba graczy")
-            _last_member_count_name[ch.id] = new_name
-            _last_member_count_edit_at[ch.id] = _time.monotonic()
-            _member_count_dirty.discard(guild.id)
-            print(f"👥 Licznik graczy: {new_name}")
-        except discord.HTTPException as e:
-            _member_count_dirty.add(guild.id)
-            print(f"Member count edit: {e}")
-        except Exception as e:
-            print(f"Member count edit: {e}")
+    try:
+        if delta is not None:
+            legit_count_cache = max(0, legit_count_cache + delta)
+            count = legit_count_cache
+        else:
+            count = await count_legit_messages(ch)
+            legit_count_cache = count
+        new_name = f"✅legit-check✅➔{count}"
+        if ch.name != new_name:
+            await ch.edit(name=new_name, reason="Aktualizacja licznika legitek")
+            print(f"[legit] nazwa kanału → {new_name}")
+    except Exception as e:
+        print(f"[legit] błąd zmiany nazwy: {e}")
 
 
-async def member_count_loop():
+async def post_legit_embed(
+    channel: discord.TextChannel,
+    *,
+    buyer_text: str,
+    amount: str,
+    method: str,
+    buyer_mention: str = None,
+):
+    """Wysyła embed NOWA TRANSAKCJA (bez godziny, bez handlarza)."""
+    amount_clean = amount.strip()
+    if not amount_clean.upper().endswith("PLN"):
+        amount_clean = f"{amount_clean} PLN"
+
+    embed = discord.Embed(title="📄 NOWA TRANSAKCJA", color=0x2B2D31)
+    embed.add_field(name="👤 Kupujący", value=buyer_text, inline=False)
+    embed.add_field(name="💰 Kwota", value=amount_clean, inline=True)
+    embed.add_field(name="🏷 Metoda", value=method, inline=True)
+    if LEGIT_LOGO_URL:
+        embed.set_thumbnail(url=LEGIT_LOGO_URL)
+
+    content = buyer_mention if buyer_mention else None
+    return await channel.send(content=content, embed=embed)
+
+
+async def _legit_startup_count():
     await bot.wait_until_ready()
-    while not bot.is_closed():
-        try:
-            for gid in list(_member_count_dirty):
-                g = bot.get_guild(gid)
-                if g:
-                    await update_member_count_channel(g)
-            # rzadki pełny refresh
-            for g in bot.guilds:
-                await update_member_count_channel(g)
-        except Exception as e:
-            print(f"member_count_loop: {e}")
-        await asyncio.sleep(90)
+    await asyncio.sleep(2)
+    await update_legit_channel_name()
 
 
 # ===================== EVENTS =====================
@@ -560,12 +501,8 @@ async def on_ready():
     bot.add_view(TicketControlView())
     bot.add_view(GiveawayView())
     bot.loop.create_task(giveaway_watcher())
-    bot.loop.create_task(member_count_loop())
-    for g in bot.guilds:
-        try:
-            await update_member_count_channel(g)
-        except Exception:
-            pass
+    if LEGIT_CHANNEL_ID:
+        bot.loop.create_task(_legit_startup_count())
     try:
         print(f"✅ Zalogowano: {bot.user}")
         # Tylko komendy SERWEROWE (szybkie, bez duplikatów)
@@ -604,6 +541,23 @@ async def on_transcript_button(interaction: discord.Interaction):
 
 
 @bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    """Po usunięciu wiadomości na kanale legitek — przelicz licznik."""
+    if not LEGIT_CHANNEL_ID or payload.channel_id != LEGIT_CHANNEL_ID:
+        return
+    await asyncio.sleep(0.5)
+    await update_legit_channel_name()
+
+
+@bot.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent):
+    if not LEGIT_CHANNEL_ID or payload.channel_id != LEGIT_CHANNEL_ID:
+        return
+    await asyncio.sleep(0.5)
+    await update_legit_channel_name()
+
+
+@bot.event
 async def on_invite_create(invite):
     await update_invite_cache(invite.guild)
 
@@ -627,7 +581,7 @@ async def on_member_join(member: discord.Member):
                 inviter = inv.inviter
                 invite_code = inv.code
                 inviter_id = inviter.id if inviter else 0
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with aiosqlite.connect("moderation.db") as db:
                     # Usuń stare wpisy tej osoby (np. po rejoin) i wstaw aktualny
                     await db.execute("DELETE FROM invites WHERE invited_id = ?", (member.id,))
                     await db.execute(
@@ -669,12 +623,10 @@ async def on_member_join(member: discord.Member):
                 await member.add_roles(role, reason="Automatyczna weryfikacja")
             except Exception:
                 pass
-    mark_member_count_dirty(member.guild)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    mark_member_count_dirty(member.guild)
     # Usuń aktywne zaproszenie — licznik invitera spada
     inviter_id = await remove_invite_for_member(member.id)
     if INVITE_LOG_CHANNEL_ID and inviter_id:
@@ -696,7 +648,6 @@ async def on_member_remove(member: discord.Member):
                 await channel.send(f"{member.mention} wyszedł z serwera")
             except Exception:
                 pass
-    mark_member_count_dirty(member.guild)
 
 
 @bot.event
@@ -745,112 +696,21 @@ async def on_voice_state_update(member, before, after):
             asyncio.create_task(delete_later())
 
 
-# Filtr — tylko MOCNE wyzwiska / slur-y
-# WOLNE (lekkie/średnie): kurwa, dupa, szmata, cioto, cepie, idioto, debil,
-#   frajer/frajerze, śmieciu, biedaku, noob, noobie, chuj wie, no kurwa
-_RE_DIRECTED = re.compile(
-    r"(?:\bty\b|\btob[ieę]\b|<@!?\d+>)\s*[,.:\-]*\s*"
-    r"(?:"
-    r"kurwo\b|kurwy\b|skurwysyn\w*|skurwielu\b|skurwiel\b|skurwysynek\b|"
-    r"suko\b|sukinsyn\w*|sukinku\b|"
-    r"pizdo\b|pizdy\b|pizdzie\b|"
-    r"chuju\b|chuja\b|huju\b|chujku\b|"
-    r"cwelu\b|cwela\b|cwele\b|cwel\b|cweliku\b|"
-    r"dziwko\b|dziwka\b|dziweczko\b|"
-    r"szmato\b|"
-    r"jebany\b|jebana\b|jebane\b|jebaka\b|zajebana\b|zajebany\b|dojebany\b|"
-    r"pedale\b|pedal\b|"
-    r"zjebie\b|zjeb\b|wypierdku\b|wypierdek\b|"
-    r"śmierdzielu\b|smierdzielu\b|gnido\b|gnida\b|"
-    r"zdzir\w*|pojebie\b|pojeb\b|psycholu\b|"
-    r"mendo\b|menda\b|skurwysynu\b"
-    r")",
-    re.IGNORECASE,
-)
-_RE_DIRECTED_REV = re.compile(
-    r"(?:kurwo|suko|pizdo|chuju|huju|cwelu|cwela|dziwko|dziwka|szmato|"
-    r"skurwielu|zjebie|gnido|pojebie|mendo)\s+ty\b",
-    re.IGNORECASE,
-)
-_RE_VOCATIVE = re.compile(
-    r"\b("
-    r"kurwo|suko|pizdo|chuju|huju|chujku|"
-    r"cwelu|cwela|cwele|cweliku|"
-    r"dziwko|dziwka|dziweczko|szmato|"
-    r"skurwysynu|skurwysyn|skurwielu|skurwiel|"
-    r"zjebie|wypierdku|gnido|pojebie|mendo|"
-    r"sukinsynu|sukinsyn"
-    r")\b",
-    re.IGNORECASE,
-)
-_RE_HARD = re.compile(
-    r"\b("
-    r"spierdalaj|wypierdalaj|spierdolina|spierdoliny|"
-    r"jeba[cć]\s+ci[eę]|jebane?\s+ci[eę]|jebac[cć]?\s+ci[eę]|"
-    r"pierdol\s*si[eę]|pierdolony|pierdolona|"
-    r"rozjebi[eę]\s+ci[eę]|rozjebie\s+ci[eę]|zapierdole\s+ci[eę]|"
-    r"n[i1l!]+[gq]+[aeeruhx3]{1,6}|"
-    r"fag+ot|fagg?ot|"
-    r"c+u+n+t+|"
-    r"kike\b|tranny\b|retard(?:ed)?\b"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def message_is_toxic(content: str) -> bool:
-    if not content:
-        return False
-    t = content.replace("@", "a")
-    return bool(
-        _RE_DIRECTED.search(t)
-        or _RE_DIRECTED_REV.search(t)
-        or _RE_VOCATIVE.search(t)
-        or _RE_HARD.search(t)
-    )
-
-
 @bot.event
 async def on_message(message):
     if not message.guild:
         return
 
-    # Log ticketa NA BIEŻĄCO (także bot — potem filtrujemy przy exportcie)
-    try:
-        row = await _get_ticket(message.channel.id)
-        if row:
-            await _log_ticket_message(message)
-    except Exception:
-        pass
+    # ===== LEGIT — licznik (bot też się liczy, ignore pomijamy) =====
+    if LEGIT_CHANNEL_ID and message.channel.id == LEGIT_CHANNEL_ID:
+        if message.author.id not in LEGIT_IGNORE_IDS:
+            if not (message.author.bot and message.author.id != bot.user.id):
+                await update_legit_channel_name(message.channel, delta=1)
+        if message.author.bot:
+            return
 
     if message.author.bot:
         return
-
-    # ===== FILTR WYZWISK =====
-    # Mode / admin / owner omijają
-    try:
-        if not (
-            message.author.guild_permissions.manage_messages
-            or message.author.guild_permissions.administrator
-            or message.author.id == message.guild.owner_id
-        ):
-            if message_is_toxic(message.content or ""):
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-                # Na kanale (nie PV). Discord NIE ma true "Only you can see this"
-                # poza slash/button — ostrzeżenie + Anuluj, znika samo po 15s.
-                try:
-                    await message.channel.send(
-                        f"{message.author.mention} ❌ **Zachowaj kulturę na chacie.**",
-                        delete_after=5,
-                    )
-                except Exception:
-                    pass
-                return
-    except Exception:
-        pass
 
     # ===== PROPOZYCJE =====
     if SUGGESTION_CHANNEL_ID and message.channel.id == SUGGESTION_CHANNEL_ID:
@@ -1171,7 +1031,7 @@ async def cmd_unmutevoice(interaction: discord.Interaction, uzytkownik: discord.
 @app_commands.describe(uzytkownik="Kogo", powod="Powód")
 @is_mod()
 async def cmd_warn(interaction: discord.Interaction, uzytkownik: discord.Member, powod: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         await db.execute(
             "INSERT INTO warnings (user_id, moderator_id, reason, timestamp) VALUES (?,?,?,?)",
             (uzytkownik.id, interaction.user.id, powod, datetime.now(timezone.utc).isoformat()),
@@ -1189,40 +1049,22 @@ async def cmd_warn(interaction: discord.Interaction, uzytkownik: discord.Member,
     await notify_user(uzytkownik, interaction.guild, action="warned", color=0xFFFF00, reason=powod, extra=f"Łącznie warnów: **{count}**")
 
 
-@bot.tree.command(name="warnings", description="Warny użytkownika albo wszystkie na serwerze")
-@app_commands.describe(uzytkownik="Zostaw puste = wszystkie warny na serwerze")
+@bot.tree.command(name="warnings", description="Sprawdź ostrzeżenia")
+@app_commands.describe(uzytkownik="Kogo")
 @is_mod()
-async def cmd_warnings(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        if uzytkownik:
-            cur = await db.execute(
-                "SELECT user_id, reason, timestamp, moderator_id FROM warnings WHERE user_id = ? ORDER BY id DESC",
-                (uzytkownik.id,),
-            )
-        else:
-            cur = await db.execute(
-                "SELECT user_id, reason, timestamp, moderator_id FROM warnings ORDER BY id DESC LIMIT 30",
-            )
+async def cmd_warnings(interaction: discord.Interaction, uzytkownik: discord.Member):
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute(
+            "SELECT reason, timestamp, moderator_id FROM warnings WHERE user_id = ? ORDER BY id DESC",
+            (uzytkownik.id,),
+        )
         rows = await cur.fetchall()
-
     if not rows:
-        if uzytkownik:
-            return await interaction.response.send_message(
-                f"{uzytkownik.mention} nie ma ostrzeżeń.", ephemeral=True
-            )
-        return await interaction.response.send_message("Brak warnów na serwerze.", ephemeral=True)
-
-    title = f"Warny — {uzytkownik}" if uzytkownik else "Wszystkie warny na serwerze"
-    embed = discord.Embed(title=title, color=0xFFA500, timestamp=datetime.now(timezone.utc))
-    for i, (uid, reason, ts, mod) in enumerate(rows[:15], 1):
-        try:
-            tshow = f"<t:{int(datetime.fromisoformat(ts).timestamp())}:R>"
-        except Exception:
-            tshow = ts
-        who = f"<@{uid}>" if not uzytkownik else ""
-        val = f"{who + ' • ' if who else ''}{reason}\nMod: <@{mod}>"
-        embed.add_field(name=f"#{i} • {tshow}", value=val[:1024], inline=False)
-    embed.set_footer(text=f"Pokazano {min(len(rows), 15)} / łącznie w wyniku: {len(rows)}")
+        return await interaction.response.send_message(f"{uzytkownik.mention} nie ma ostrzeżeń.", ephemeral=True)
+    embed = discord.Embed(title=f"Warny — {uzytkownik}", color=0xFFA500, timestamp=datetime.now(timezone.utc))
+    for i, (reason, ts, mod) in enumerate(rows[:12], 1):
+        embed.add_field(name=f"#{i} • <t:{int(datetime.fromisoformat(ts).timestamp())}:R>", value=f"{reason}\nMod: <@{mod}>", inline=False)
+    embed.set_footer(text=f"Łącznie: {len(rows)}")
     await interaction.response.send_message(embed=embed)
 
 
@@ -1230,7 +1072,7 @@ async def cmd_warnings(interaction: discord.Interaction, uzytkownik: Optional[di
 @app_commands.describe(uzytkownik="Kogo")
 @is_mod()
 async def cmd_clearwarns(interaction: discord.Interaction, uzytkownik: discord.Member):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         await db.execute("DELETE FROM warnings WHERE user_id = ?", (uzytkownik.id,))
         await db.commit()
     embed = discord.Embed(title="🧹 Warny wyczyszczone", color=0x00FF00, timestamp=datetime.now(timezone.utc))
@@ -1248,7 +1090,7 @@ async def cmd_clearwarns(interaction: discord.Interaction, uzytkownik: discord.M
 @app_commands.describe(uzytkownik="Kogo")
 @is_mod()
 async def cmd_warn_remove(interaction: discord.Interaction, uzytkownik: discord.Member):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         await db.execute("DELETE FROM warnings WHERE user_id = ?", (uzytkownik.id,))
         await db.commit()
     embed = discord.Embed(title="🧹 Warny usunięte", color=0x00FF00, timestamp=datetime.now(timezone.utc))
@@ -1270,6 +1112,96 @@ async def cmd_clear(interaction: discord.Interaction, ilosc: app_commands.Range[
     deleted = await interaction.channel.purge(limit=ilosc)
     embed = discord.Embed(title="🧹 Usunięto", description=f"**{len(deleted)}** wiadomości", color=0x3498DB)
     await interaction.followup.send(embed=embed, ephemeral=True)
+    await send_log(embed)
+
+
+@bot.tree.command(
+    name="clear_all",
+    description="⚠️ Usuń wiadomości na WSZYSTKICH kanałach tekstowych (wymaga potwierdzenia)",
+)
+@app_commands.describe(potwierdzenie='Napisz dokładnie: potwierdzam')
+@is_mod()
+async def cmd_clear_all(interaction: discord.Interaction, potwierdzenie: str):
+    """Usuwa wiadomości na wszystkich kanałach tekstowych.
+    Discord pozwala masowo usuwać tylko wiadomości młodsze niż 14 dni.
+    """
+    if potwierdzenie.strip().lower() != "potwierdzam":
+        return await interaction.response.send_message(
+            "❌ **Anulowano.**\n"
+            "Aby usunąć wiadomości na **wszystkich** kanałach, musisz napisać dokładnie:\n"
+            "```\npotwierdzam\n```",
+            ephemeral=True,
+        )
+
+    if not (
+        interaction.user.id == interaction.guild.owner_id
+        or interaction.user.guild_permissions.administrator
+    ):
+        return await interaction.response.send_message(
+            "❌ Ta komenda jest dostępna tylko dla **Administratora** lub **Właściciela** serwera.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    total_deleted = 0
+    channels_ok = 0
+    channels_fail = 0
+    errors = []
+
+    text_channels = [
+        ch for ch in interaction.guild.text_channels
+        if ch.permissions_for(interaction.guild.me).manage_messages
+    ]
+
+    status_msg = await interaction.followup.send(
+        f"⏳ Czyszczenie **{len(text_channels)}** kanałów...\n"
+        f"To może potrwać chwilę (limit Discord: tylko wiadomości < 14 dni).",
+        ephemeral=True,
+        wait=True,
+    )
+
+    for ch in text_channels:
+        try:
+            deleted = await ch.purge(limit=None, bulk=True)
+            count = len(deleted)
+            total_deleted += count
+            channels_ok += 1
+            if count > 0:
+                print(f"[clear_all] {ch.name}: usunięto {count}")
+        except discord.Forbidden:
+            channels_fail += 1
+            errors.append(f"`#{ch.name}` — brak uprawnień")
+        except discord.HTTPException as e:
+            channels_fail += 1
+            errors.append(f"`#{ch.name}` — {e.status}")
+        except Exception as e:
+            channels_fail += 1
+            errors.append(f"`#{ch.name}` — {type(e).__name__}")
+        await asyncio.sleep(0.6)
+
+    embed = discord.Embed(
+        title="🧹 Clear All zakończony",
+        color=0xE74C3C,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Usunięte wiadomości", value=str(total_deleted), inline=True)
+    embed.add_field(name="Kanały OK", value=str(channels_ok), inline=True)
+    embed.add_field(name="Kanały z błędem", value=str(channels_fail), inline=True)
+    embed.add_field(
+        name="Uwaga",
+        value="Discord pozwala masowo usuwać tylko wiadomości z **ostatnich 14 dni**. Starsze zostają.",
+        inline=False,
+    )
+    if errors:
+        embed.add_field(name="Błędy (max 8)", value="\n".join(errors[:8]) or "—", inline=False)
+    embed.set_footer(text=f"Wykonane przez {interaction.user}")
+
+    try:
+        await status_msg.edit(content=None, embed=embed)
+    except Exception:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
     await send_log(embed)
 
 
@@ -1331,6 +1263,247 @@ async def cmd_setnick(interaction: discord.Interaction, uzytkownik: discord.Memb
     embed.add_field(name="Nowy", value=nowy_nick or "zresetowany")
     await interaction.response.send_message(embed=embed)
     await send_log(embed, skip_channel_id=interaction.channel_id)
+
+
+# ===================== LEGIT SYSTEM =====================
+class LegitAmountModal(discord.ui.Modal, title="Kwota transakcji"):
+    kwota = discord.ui.TextInput(
+        label="Kwota (np. 200)",
+        placeholder="200",
+        min_length=1,
+        max_length=20,
+        required=True,
+    )
+
+    def __init__(self, anonim: bool, user: discord.Member):
+        super().__init__()
+        self.anonim = anonim
+        self.user = user
+
+    async def on_submit(self, interaction: discord.Interaction):
+        amount = self.kwota.value.strip()
+        if not amount:
+            return await interaction.response.send_message("❌ Podaj kwotę.", ephemeral=True)
+        view = LegitMethodView(anonim=self.anonim, user=self.user, amount=amount)
+        await interaction.response.send_message(
+            "Wybierz **metodę płatności**:",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class LegitInneModal(discord.ui.Modal, title="Inna metoda"):
+    metoda = discord.ui.TextInput(
+        label="Opisz metodę",
+        placeholder="np. PayPal, crypto...",
+        min_length=1,
+        max_length=40,
+        required=True,
+    )
+
+    def __init__(self, anonim: bool, user: discord.Member, amount: str):
+        super().__init__()
+        self.anonim = anonim
+        self.user = user
+        self.amount = amount
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _finish_legit(
+            interaction,
+            anonim=self.anonim,
+            user=self.user,
+            amount=self.amount,
+            method=self.metoda.value.strip().upper(),
+        )
+
+
+class LegitSubSelect(discord.ui.Select):
+    def __init__(self, method_key: str, anonim: bool, user: discord.Member, amount: str):
+        self.method_key = method_key
+        self.anonim = anonim
+        self.user = user
+        self.amount = amount
+        if method_key == "blik":
+            options = [
+                discord.SelectOption(label="TEL", value="TEL", emoji="📱", description="BLIK na telefon"),
+                discord.SelectOption(label="KOD", value="KOD", emoji="🔢", description="BLIK kod"),
+            ]
+            placeholder = "BLIK — wybierz TEL lub KOD"
+        else:
+            options = [
+                discord.SelectOption(label="PARAGON", value="PARAGON", emoji="🧾", description="PSC paragon"),
+                discord.SelectOption(label="KOD", value="KOD", emoji="🔢", description="PSC kod"),
+            ]
+            placeholder = "PSC — wybierz PARAGON lub KOD"
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        sub = self.values[0]
+        method = f"{self.method_key.upper()} ({sub})"
+        await _finish_legit(
+            interaction,
+            anonim=self.anonim,
+            user=self.user,
+            amount=self.amount,
+            method=method,
+        )
+
+
+class LegitSubView(discord.ui.View):
+    def __init__(self, method_key: str, anonim: bool, user: discord.Member, amount: str):
+        super().__init__(timeout=120)
+        self.add_item(LegitSubSelect(method_key, anonim, user, amount))
+
+
+class LegitMethodSelect(discord.ui.Select):
+    def __init__(self, anonim: bool, user: discord.Member, amount: str):
+        self.anonim = anonim
+        self.user = user
+        self.amount = amount
+        options = [
+            discord.SelectOption(label="BLIK", value="blik", emoji="💙", description="BLIK → TEL lub KOD"),
+            discord.SelectOption(label="PSC", value="psc", emoji="🟡", description="Paysafecard → paragon/kod"),
+            discord.SelectOption(label="Zaproszenia", value="zaproszenia", emoji="📨", description="Zaproszenia"),
+            discord.SelectOption(label="Inne", value="inne", emoji="✏️", description="Wpisz własną metodę"),
+        ]
+        super().__init__(placeholder="Wybierz metodę płatności", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        if choice == "blik":
+            await interaction.response.send_message(
+                "BLIK — wybierz wariant:",
+                view=LegitSubView("blik", self.anonim, self.user, self.amount),
+                ephemeral=True,
+            )
+        elif choice == "psc":
+            await interaction.response.send_message(
+                "PSC — wybierz wariant:",
+                view=LegitSubView("psc", self.anonim, self.user, self.amount),
+                ephemeral=True,
+            )
+        elif choice == "zaproszenia":
+            await _finish_legit(
+                interaction,
+                anonim=self.anonim,
+                user=self.user,
+                amount=self.amount,
+                method="ZAPROSZENIA",
+            )
+        else:
+            await interaction.response.send_modal(
+                LegitInneModal(self.anonim, self.user, self.amount)
+            )
+
+
+class LegitMethodView(discord.ui.View):
+    def __init__(self, anonim: bool, user: discord.Member, amount: str):
+        super().__init__(timeout=120)
+        self.add_item(LegitMethodSelect(anonim, user, amount))
+
+
+class LegitAnonimView(discord.ui.View):
+    def __init__(self, user: discord.Member):
+        super().__init__(timeout=120)
+        self.user = user
+
+    @discord.ui.button(label="Anonim", style=discord.ButtonStyle.secondary, emoji="🕵️")
+    async def anonim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("❌ To nie Twoja legita.", ephemeral=True)
+        await interaction.response.send_modal(LegitAmountModal(anonim=True, user=self.user))
+
+    @discord.ui.button(label="Pokaż mnie", style=discord.ButtonStyle.primary, emoji="👤")
+    async def show_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("❌ To nie Twoja legita.", ephemeral=True)
+        await interaction.response.send_modal(LegitAmountModal(anonim=False, user=self.user))
+
+
+async def _finish_legit(
+    interaction: discord.Interaction,
+    *,
+    anonim: bool,
+    user: discord.Member,
+    amount: str,
+    method: str,
+):
+    if not LEGIT_CHANNEL_ID:
+        msg = "❌ Kanał legitek nie jest ustawiony (LEGIT_CHANNEL_ID)."
+        if interaction.response.is_done():
+            return await interaction.followup.send(msg, ephemeral=True)
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    channel = bot.get_channel(LEGIT_CHANNEL_ID)
+    if not channel or not isinstance(channel, discord.TextChannel):
+        msg = "❌ Nie znaleziono kanału legitek."
+        if interaction.response.is_done():
+            return await interaction.followup.send(msg, ephemeral=True)
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    if anonim:
+        buyer_text = "Anonim *(Klient zażyczył sobie aby nie wyświetlić go w legitce)*"
+        buyer_mention = None
+    else:
+        buyer_text = f"{user.mention}"
+        buyer_mention = user.mention
+
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        await post_legit_embed(
+            channel,
+            buyer_text=buyer_text,
+            amount=amount,
+            method=method,
+            buyer_mention=buyer_mention,
+        )
+        await interaction.followup.send(
+            f"✅ Legita dodana na {channel.mention}\n"
+            f"**Kwota:** {amount if amount.upper().endswith('PLN') else amount + ' PLN'}\n"
+            f"**Metoda:** {method}\n"
+            f"**Kupujący:** {'Anonim' if anonim else user.mention}",
+            ephemeral=True,
+        )
+    except Exception as e:
+        print(f"[legit] błąd post: {e}")
+        try:
+            await interaction.followup.send(f"❌ Błąd: `{e}`", ephemeral=True)
+        except Exception:
+            pass
+
+
+@bot.tree.command(name="legit", description="Dodaj legita (transakcja)")
+async def cmd_legit(interaction: discord.Interaction):
+    if not LEGIT_CHANNEL_ID:
+        return await interaction.response.send_message(
+            "❌ System legitek nie jest skonfigurowany (brak LEGIT_CHANNEL_ID).",
+            ephemeral=True,
+        )
+    view = LegitAnonimView(interaction.user)
+    await interaction.response.send_message(
+        "**Nowa legita** — czy chcesz być anonimowy?\n"
+        "🕵️ **Anonim** — nie pokaże Cię na legicie\n"
+        "👤 **Pokaż mnie** — oznaczy Cię na legicie",
+        view=view,
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="legit_refresh", description="Przelicz licznik legitek i zaktualizuj nazwę kanału")
+@is_mod()
+async def cmd_legit_refresh(interaction: discord.Interaction):
+    if not LEGIT_CHANNEL_ID:
+        return await interaction.response.send_message("❌ Brak LEGIT_CHANNEL_ID.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await update_legit_channel_name()
+    ch = bot.get_channel(LEGIT_CHANNEL_ID)
+    name = ch.name if ch else "?"
+    await interaction.followup.send(
+        f"✅ Przeliczono. Aktualna nazwa kanału: **{name}**\n"
+        f"Licznik: **{legit_count_cache}**",
+        ephemeral=True,
+    )
 
 
 # ===================== INFO =====================
@@ -1420,7 +1593,7 @@ async def cmd_ping(interaction: discord.Interaction):
 @bot.tree.command(name="help", description="Lista komend")
 async def cmd_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📚 Pomoc — komendy bota", color=0x5865F2, description="Wszystkie komendy slash `/`")
-    embed.add_field(name="Moderacja", value="`/ban` `/kick` `/mute` `/unmute` `/timeout` `/mutetext` `/mutevoice` `/warn` `/clear` `/lock` `/unlock` `/slowmode` `/nick`", inline=False)
+    embed.add_field(name="Moderacja", value="`/ban` `/kick` `/mute` `/unmute` `/timeout` `/mutetext` `/mutevoice` `/warn` `/clear` `/clear_all` `/lock` `/unlock` `/slowmode` `/nick`", inline=False)
     embed.add_field(name="Info", value="`/user` `/server` `/avatar` `/roles` `/ping` `/invites` `/help`", inline=False)
     embed.add_field(name="Kolory", value="`/color` `/colors` `/setcolor`", inline=False)
     embed.add_field(name="Ekonomia & Level", value="`/credits` `/daily` `/rep` `/rank` `/profile` `/title` `/top`", inline=False)
@@ -1429,8 +1602,9 @@ async def cmd_help(interaction: discord.Interaction):
     embed.add_field(name="Inne", value="`/roll` `/short` `/rolegive` `/roleremove`", inline=False)
     embed.add_field(name="Temp VC", value="`/tempon` `/tempoff` `/tempmax` `/temptime`", inline=False)
     embed.add_field(name="Tickety", value="`/ticket_setup` `/ticket_close`", inline=False)
+    embed.add_field(name="Legitki", value="`/legit` `/legit_refresh`", inline=False)
     embed.add_field(name="System", value="`/sync`", inline=False)
-    embed.add_field(name="Konkursy", value="`/giveaway` `/giveaway_end` `/giveaway_reroll` `/giveaway_list` `/giveaway_ban` `/giveaway_unban` `/giveaway_kick`", inline=False)
+    embed.add_field(name="Konkursy", value="`/giveaway` `/giveaway_end` `/giveaway_reroll`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1444,7 +1618,7 @@ async def cmd_invite(interaction: discord.Interaction):
 @app_commands.describe(uzytkownik="Opcjonalnie")
 async def cmd_invites(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
     target = uzytkownik or interaction.user
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT invited_id, code, timestamp FROM invites WHERE inviter_id = ? ORDER BY timestamp DESC",
             (target.id,),
@@ -1457,7 +1631,7 @@ async def cmd_invites(interaction: discord.Interaction, uzytkownik: Optional[dis
             active.append((invited_id, code, ts))
         else:
             # Sprzątanie śmieci (np. stary wpis sprzed update)
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect("moderation.db") as db:
                 await db.execute("DELETE FROM invites WHERE invited_id = ?", (invited_id,))
                 await db.commit()
     embed = discord.Embed(
@@ -1631,7 +1805,7 @@ async def cmd_profile(interaction: discord.Interaction, uzytkownik: Optional[dis
 
 @bot.tree.command(name="top", description="Top XP")
 async def cmd_top(interaction: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute("SELECT user_id, text_xp FROM economy ORDER BY text_xp DESC LIMIT 10")
         rows = await cur.fetchall()
     if not rows:
@@ -1670,7 +1844,7 @@ async def cmd_points_set(interaction: discord.Interaction, uzytkownik: discord.M
 
 @bot.tree.command(name="points_list", description="Lista punktów")
 async def cmd_points_list(interaction: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute("SELECT user_id, points FROM points WHERE points > 0 ORDER BY points DESC LIMIT 15")
         rows = await cur.fetchall()
     if not rows:
@@ -1684,7 +1858,7 @@ async def cmd_points_list(interaction: discord.Interaction):
 @app_commands.describe(uzytkownik="Kogo (puste = wszyscy)")
 @is_mod()
 async def cmd_points_reset(interaction: discord.Interaction, uzytkownik: Optional[discord.Member] = None):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         if uzytkownik:
             await db.execute("UPDATE points SET points = 0 WHERE user_id = ?", (uzytkownik.id,))
             msg = f"✅ Zresetowano punkty {uzytkownik.mention}."
@@ -1855,7 +2029,7 @@ def _is_ticket_staff(member: discord.Member) -> bool:
 
 
 async def _get_ticket(channel_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT user_id, category, closed, claimed_by, created_at, ticket_number FROM tickets WHERE channel_id = ?",
             (channel_id,),
@@ -1864,118 +2038,37 @@ async def _get_ticket(channel_id: int):
 
 
 async def _next_ticket_number() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute("SELECT COALESCE(MAX(ticket_number), 0) FROM tickets")
         row = await cur.fetchone()
         return (row[0] or 0) + 1
 
 
-async def _log_ticket_message(message: discord.Message):
-    """Zapis na bieżąco — nie ginie przy zamknięciu / limicie historii."""
-    if not message.guild or not message.channel:
-        return
-    content = (message.content or "").strip()
-    if message.attachments:
-        atts = ", ".join(a.filename for a in message.attachments)
-        content = (content + f" [pliki: {atts}]").strip()
-    if not content and not message.embeds:
-        return
-    if not content and message.embeds:
-        # krótki opis embedów (np. systemowe)
-        parts = []
-        for e in message.embeds[:2]:
-            if e.title:
-                parts.append(str(e.title))
-            if e.description:
-                parts.append(str(e.description)[:300])
-        content = " | ".join(parts) if parts else "[embed]"
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                """INSERT OR IGNORE INTO ticket_messages
-                   (channel_id, message_id, author_id, author_name, content, is_bot, created_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (
-                    message.channel.id,
-                    message.id,
-                    message.author.id,
-                    str(message.author.display_name),
-                    content,
-                    1 if message.author.bot else 0,
-                    (message.created_at.replace(tzinfo=timezone.utc).isoformat()
-                     if message.created_at else datetime.now(timezone.utc).isoformat()),
-                ),
-            )
-            await db.commit()
-    except Exception as e:
-        print(f"ticket msg log: {e}")
-
-
 async def _collect_ticket_messages(channel: discord.TextChannel):
-    """Pełna historia z Discord + backup z bazy (na bieżąco)."""
     messages = []
     try:
-        # limit=None = wszystkie wiadomości na kanale
-        async for msg in channel.history(limit=None, oldest_first=True):
+        async for msg in channel.history(limit=500, oldest_first=True):
             messages.append(msg)
-            try:
-                await _log_ticket_message(msg)
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"ticket history fetch: {e}")
+    except Exception:
+        pass
     return messages
 
 
-async def _humans_from_db(channel_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """SELECT author_name, content, message_id FROM ticket_messages
-               WHERE channel_id = ? AND is_bot = 0 AND content != ''
-               ORDER BY id ASC""",
-            (channel_id,),
-        )
-        rows = await cur.fetchall()
-    return [{"author": r[0], "content": r[1], "mid": r[2]} for r in rows]
-
-
-async def _human_messages_only(messages, channel_id: int = None):
-    """Historia Discord + baza — scalone, bez duplikatów."""
-    by_mid = {}
-    order = []
-
-    for msg in messages or []:
-        if getattr(msg.author, "bot", False):
+async def _human_messages_only(messages):
+    """Tylko wiadomości od ludzi (bez botów), z treścią."""
+    out = []
+    for msg in messages:
+        if msg.author.bot:
             continue
         content = (msg.content or "").strip()
+        if not content and not msg.attachments:
+            continue
+        line = content if content else ""
         if msg.attachments:
             atts = ", ".join(a.filename for a in msg.attachments)
-            content = (content + f" [pliki: {atts}]").strip()
-        if not content:
-            continue
-        mid = msg.id
-        if mid not in by_mid:
-            order.append(mid)
-        by_mid[mid] = {"author": str(msg.author.display_name), "content": content, "mid": mid}
-
-    ch_id = channel_id
-    if ch_id is None and messages:
-        try:
-            ch_id = messages[0].channel.id
-        except Exception:
-            ch_id = None
-    if ch_id:
-        try:
-            for h in await _humans_from_db(ch_id):
-                mid = h.get("mid") or f"db-{h['author']}-{h['content'][:40]}"
-                if mid in by_mid:
-                    continue
-                order.append(mid)
-                by_mid[mid] = h
-        except Exception as e:
-            print(f"merge db humans: {e}")
-
-    return [{"author": by_mid[m]["author"], "content": by_mid[m]["content"]} for m in order]
+            line = (line + f" [pliki: {atts}]").strip()
+        out.append({"author": str(msg.author.display_name), "content": line})
+    return out
 
 
 async def _build_transcript_txt(
@@ -1988,7 +2081,6 @@ async def _build_transcript_txt(
     reason: str,
     claimed_by: int,
     created_at: str,
-    humans_override=None,
 ) -> bytes:
     """Czytelny TXT — tylko ludzie, bez dat i bez wiadomości bota."""
     cat_label = category
@@ -1996,7 +2088,7 @@ async def _build_transcript_txt(
         if c["value"] == category:
             cat_label = c["label"]
             break
-    humans = humans_override if humans_override is not None else await _human_messages_only(messages)
+    humans = await _human_messages_only(messages)
     lines = [
         f"=== Przebieg rozmowy ===",
         f"Serwer: {SERVER_NAME}",
@@ -2093,9 +2185,7 @@ async def _close_ticket(
             cat_label = f'{c["emoji"]} {c["label"]}'
             break
 
-    # Najpierw zbierz historię (i dociągnij do logu), potem buduj transcript
     messages = await _collect_ticket_messages(channel)
-    humans = await _human_messages_only(messages, channel_id=channel.id)
 
     txt_bytes = await _build_transcript_txt(
         messages,
@@ -2106,10 +2196,10 @@ async def _close_ticket(
         reason=reason,
         claimed_by=claimed_by or 0,
         created_at=created_at or "?",
-        humans_override=humans,
     )
+    humans = await _human_messages_only(messages)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         await db.execute(
             "UPDATE tickets SET closed = 1, close_reason = ? WHERE channel_id = ?",
             (reason, channel.id),
@@ -2134,7 +2224,7 @@ async def _close_ticket(
 
     # Zapisz transcript do bazy (przycisk w DM)
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect("moderation.db") as db:
             await db.execute(
                 "INSERT OR REPLACE INTO ticket_transcripts (ticket_number, channel_id, content_txt, created_at) VALUES (?,?,?,?)",
                 (
@@ -2220,85 +2310,76 @@ async def _close_ticket(
 
 
 async def _send_transcript_file(interaction: discord.Interaction, tnum: int):
-    """Pełny przebieg na PV / ephemeral — zawsze jako plik TXT (bez limitu 10 embedów)."""
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT content_txt FROM ticket_transcripts WHERE ticket_number = ?",
-                (tnum,),
-            )
-            row = await cur.fetchone()
-        if not row or not row[0]:
-            if interaction.response.is_done():
-                return await interaction.followup.send("❌ Brak zapisanego przebiegu.", ephemeral=True)
-            return await interaction.response.send_message("❌ Brak zapisanego przebiegu.", ephemeral=True)
-
-        raw = row[0]
-        # Plik z CAŁYM przebiegiem
-        data = raw.encode("utf-8", errors="replace")
-        file = discord.File(fp=io.BytesIO(data), filename=f"ticket-{tnum}-przebieg.txt")
-
-        # Podgląd: max 5 pierwszych wiadomości użytkowników (embed)
-        blocks = []
-        lines = raw.splitlines()
-        i = 0
-        while i < len(lines) and len(blocks) < 5:
-            line = lines[i].rstrip()
-            if line.endswith(":") and not line.startswith("=") and not line.startswith("-"):
-                author = line[:-1].strip()
-                body_lines = []
-                i += 1
-                while i < len(lines) and lines[i].startswith("  "):
-                    body_lines.append(lines[i].strip())
-                    i += 1
-                body = "\n".join(body_lines).strip()
-                if author and body:
-                    blocks.append((author, body))
-                continue
-            i += 1
-
-        embeds = []
-        colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245]
-        for idx, (author, content) in enumerate(blocks):
-            embeds.append(
-                discord.Embed(
-                    description=f"**{author}**\n{content[:900]}",
-                    color=colors[idx % len(colors)],
-                )
-            )
-
-        total_msgs = raw.count("\n  ")  # przybliżenie
-        header = (
-            f"📄 **Pełny przebieg ticketa #{tnum}**\n"
-            f"W załączniku jest **cała** rozmowa (TXT).\n"
-            f"Poniżej krótki podgląd (max 5 wiadomości)."
-        )
-
-        kwargs = {
-            "content": header,
-            "file": file,
-            "ephemeral": True,
-        }
-        if embeds:
-            kwargs["embeds"] = embeds
-
-        if interaction.response.is_done():
-            await interaction.followup.send(**kwargs)
-        else:
-            await interaction.response.send_message(**kwargs)
-    except discord.HTTPException as e:
-        print(f"transcript send HTTP: {e}")
+    # Unikaj podwójnej odpowiedzi (View + listen)
+    if interaction.response.is_done():
         return
-    except Exception as e:
-        print(f"transcript send: {e}")
+    async with aiosqlite.connect("moderation.db") as db:
+        cur = await db.execute(
+            "SELECT content_txt FROM ticket_transcripts WHERE ticket_number = ?",
+            (tnum,),
+        )
+        row = await cur.fetchone()
+    if not row or not row[0]:
         try:
-            if interaction.response.is_done():
-                await interaction.followup.send(f"❌ Błąd: `{e}`", ephemeral=True)
-            else:
-                await interaction.response.send_message(f"❌ Błąd: `{e}`", ephemeral=True)
+            return await interaction.response.send_message(
+                "❌ Przebieg niedostępny (wygasł lub usunięty).", ephemeral=True
+            )
         except Exception:
-            pass
+            return
+    raw = row[0]
+    embeds = []
+    colors = [0x57F287, 0x5865F2, 0xFEE75C, 0xEB459E, 0xED4245, 0x00D4FF]
+    blocks = []
+    current_author = None
+    current_lines = []
+    skip_prefixes = ("===", "---", "Serwer:", "Kategoria:", "Powod", "Zamkniety", "Powód")
+    for line in raw.splitlines():
+        if any(line.startswith(p) for p in skip_prefixes) or not line.strip():
+            if line.startswith("  ") and current_author is not None:
+                current_lines.append(line.strip())
+            continue
+        if line.endswith(":") and not line.startswith(" "):
+            if current_author and current_lines:
+                blocks.append((current_author, "\n".join(current_lines)))
+            current_author = line[:-1].strip()
+            current_lines = []
+        elif line.startswith("  ") and current_author is not None:
+            current_lines.append(line.strip())
+        elif current_author is not None and line.strip():
+            current_lines.append(line.strip())
+    if current_author and current_lines:
+        blocks.append((current_author, "\n".join(current_lines)))
 
+    try:
+        if not blocks:
+            embed = discord.Embed(
+                title="📄 Przebieg rozmowy",
+                description=(raw[:4000] if raw else "Brak wiadomości."),
+                color=0x5865F2,
+            )
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # Kolor stały per gracz w ramach ticketa; inny ticket = inna paleta
+        author_color = {}
+        for author, content in blocks[:20]:
+            if author not in author_color:
+                # hash(nick + nr ticketa) → inny kolor w każdym tickecie
+                h = sum(ord(c) for c in f"{author}:{tnum}")
+                author_color[author] = colors[h % len(colors)]
+            emb = discord.Embed(
+                description=f"**{author}**\n{content[:1000]}",
+                color=author_color[author],
+            )
+            embeds.append(emb)
+
+        await interaction.response.send_message(
+            content="📄 **Przebieg rozmowy** (tylko wiadomości użytkowników):",
+            embeds=embeds[:10],
+            ephemeral=True,
+        )
+    except discord.HTTPException:
+        # Interaction already acknowledged — ignoruj
+        return
 
 
 class TicketTranscriptView(discord.ui.View):
@@ -2395,7 +2476,7 @@ class TicketControlView(discord.ui.View):
         if claimed_by == interaction.user.id:
             return await interaction.response.send_message("✅ Już claimnąłeś ten ticket.", ephemeral=True)
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect("moderation.db") as db:
             await db.execute(
                 "UPDATE tickets SET claimed_by = ? WHERE channel_id = ?",
                 (interaction.user.id, interaction.channel.id),
@@ -2438,7 +2519,7 @@ class TicketControlView(discord.ui.View):
                 f"❌ Ticket claimnięty przez <@{claimed_by}>.", ephemeral=True
             )
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect("moderation.db") as db:
             await db.execute(
                 "UPDATE tickets SET claimed_by = 0 WHERE channel_id = ?",
                 (interaction.channel.id,),
@@ -2485,7 +2566,7 @@ class TicketSelect(discord.ui.Select):
         cat_label = cat_info["label"] if cat_info else category
         cat_emoji = cat_info["emoji"] if cat_info else "🎫"
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect("moderation.db") as db:
             cur = await db.execute(
                 "SELECT channel_id FROM tickets WHERE user_id = ? AND closed = 0",
                 (interaction.user.id,),
@@ -2497,7 +2578,7 @@ class TicketSelect(discord.ui.Select):
                 return await interaction.response.send_message(
                     f"❌ Masz już otwarty ticket: {ch.mention}", ephemeral=True
                 )
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect("moderation.db") as db:
                 await db.execute("UPDATE tickets SET closed = 1 WHERE channel_id = ?", (existing[0],))
                 await db.commit()
 
@@ -2553,7 +2634,7 @@ class TicketSelect(discord.ui.Select):
         except Exception as e:
             return await interaction.followup.send(f"❌ Nie udało się utworzyć ticketa: `{e}`", ephemeral=True)
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect("moderation.db") as db:
             await db.execute(
                 "INSERT INTO tickets (channel_id, user_id, category, created_at, closed, claimed_by, ticket_number) VALUES (?,?,?,?,0,0,?)",
                 (ticket_ch.id, interaction.user.id, category, datetime.now(timezone.utc).isoformat(), tnum),
@@ -2616,9 +2697,9 @@ async def cmd_ticket_setup(interaction: discord.Interaction):
             "Wybierz kategorię z menu poniżej, aby otworzyć ticketa.\n\n"
             "**Dostępne kategorie:**\n"
             "🛒 **Zakup** — produkt / usługa\n"
-            "🎁 **Odbiór nagrody** — konkurs / zaproszenia\n"
             "🆘 **Pomoc** — wsparcie techniczne\n"
-            "🤝 **Współpraca** — oferty partnerskie"
+            "🤝 **Współpraca** — oferty partnerskie\n"
+            "❓ **Inne** — pozostałe sprawy"
         ),
         color=0x5865F2,
     )
@@ -2708,7 +2789,7 @@ def parse_end_datetime(s: str) -> Optional[datetime]:
 
 
 async def _giveaway_entry_count(gid: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
         )
@@ -2760,14 +2841,9 @@ async def _build_giveaway_embed(
     return embed
 
 
-def _gw_rng():
-    """Losowanie niezależne od stałego seeda."""
-    return random.SystemRandom()
-
-
 async def _end_giveaway(gid: int):
-    """Losuje zwycięzców i ogłasza na kanale konkursu."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    """Losuje zwycięzców (wywoływane dopiero ~30s po oficjalnym końcu)."""
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT channel_id, message_id, prize, winners_count, end_at, host_id, ended FROM giveaways WHERE id = ?",
             (gid,),
@@ -2781,36 +2857,23 @@ async def _end_giveaway(gid: int):
             "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
         )
         entries = [r[0] for r in await cur2.fetchall()]
-        # wyklucz zbanowanych
-        cur3 = await db.execute("SELECT user_id FROM giveaway_bans")
-        banned = {r[0] for r in await cur3.fetchall()}
-        entries = [u for u in entries if u not in banned]
-
-        participants = len(entries)
-        winners = []
-        if entries:
-            k = min(int(winners_count), len(entries))
-            winners = _gw_rng().sample(entries, k)
-            for uid in winners:
-                await db.execute(
-                    "INSERT OR IGNORE INTO giveaway_winners (giveaway_id, user_id) VALUES (?, ?)",
-                    (gid, uid),
-                )
         await db.commit()
 
     channel = bot.get_channel(channel_id)
     if not channel:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except Exception:
-            return
+        return
+
+    participants = len(entries)
+    winners = []
+    if entries:
+        k = min(winners_count, len(entries))
+        winners = random.sample(entries, k)
 
     role = None
-    guild = getattr(channel, "guild", None)
-    if GIVEAWAY_WIN_ROLE_ID and guild:
-        role = guild.get_role(GIVEAWAY_WIN_ROLE_ID)
+    if GIVEAWAY_WIN_ROLE_ID and getattr(channel, "guild", None):
+        role = channel.guild.get_role(GIVEAWAY_WIN_ROLE_ID)
     for uid in winners:
-        member = guild.get_member(uid) if guild else None
+        member = channel.guild.get_member(uid) if channel.guild else None
         if member and role:
             try:
                 await member.add_roles(role, reason=f"Wygrana w konkursie #{gid}")
@@ -2843,12 +2906,9 @@ async def _end_giveaway(gid: int):
 
     if winners:
         extra = f"\nRola {role.mention} nadana automatycznie." if role else ""
-        try:
-            await channel.send(
-                f"🎉 **Konkurs zakończony!**\nNagroda: **{prize}**\nZwycięzcy: {winners_mentions}{extra}"
-            )
-        except Exception:
-            pass
+        await channel.send(
+            f"🎉 **Konkurs zakończony!**\nNagroda: **{prize}**\nZwycięzcy: {winners_mentions}{extra}"
+        )
     else:
         try:
             await channel.send("🎉 Konkurs zakończony — brak uczestników.")
@@ -2860,7 +2920,7 @@ async def giveaway_watcher():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect("moderation.db") as db:
                 cur = await db.execute("SELECT id, end_at FROM giveaways WHERE ended = 0")
                 rows = await cur.fetchall()
             now = datetime.now(timezone.utc)
@@ -2879,35 +2939,6 @@ async def giveaway_watcher():
         await asyncio.sleep(5)  # sprawdzaj co 5s — prawie od razu po końcu
 
 
-async def _gw_get(message_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, ended, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
-            (message_id,),
-        )
-        return await cur.fetchone()
-
-
-async def _gw_refresh_embed(interaction: discord.Interaction, row):
-    gid, ended, prize, winners_count, end_at, host_id = row
-    count = await _giveaway_entry_count(gid)
-    end_dt = datetime.fromisoformat(end_at)
-    host = interaction.guild.get_member(host_id) if interaction.guild else interaction.user
-    embed = await _build_giveaway_embed(
-        prize=prize,
-        end_at=end_dt,
-        winners_count=winners_count,
-        participants=count,
-        host=host or interaction.user,
-        ended=bool(ended),
-    )
-    try:
-        await interaction.message.edit(embed=embed, view=GiveawayView())
-    except Exception:
-        pass
-    return count
-
-
 class GiveawayJoinButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
@@ -2918,7 +2949,12 @@ class GiveawayJoinButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        row = await _gw_get(interaction.message.id)
+        async with aiosqlite.connect("moderation.db") as db:
+            cur = await db.execute(
+                "SELECT id, ended, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
+                (interaction.message.id,),
+            )
+            row = await cur.fetchone()
         if not row:
             return await interaction.response.send_message("❌ Ten konkurs już nie istnieje.", ephemeral=True)
         gid, ended, prize, winners_count, end_at, host_id = row
@@ -2935,123 +2971,36 @@ class GiveawayJoinButton(discord.ui.Button):
         except Exception:
             pass
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT reason FROM giveaway_bans WHERE user_id = ?",
-                (interaction.user.id,),
-            )
-            ban = await cur.fetchone()
-            if ban:
-                return await interaction.response.send_message(
-                    f"❌ Masz blokadę konkursów.\nPowód: {ban[0] or 'brak'}",
-                    ephemeral=True,
-                )
+        async with aiosqlite.connect("moderation.db") as db:
             cur = await db.execute(
                 "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
                 (gid, interaction.user.id),
             )
-            if await cur.fetchone():
-                return await interaction.response.send_message(
-                    "✅ Już jesteś zapisany. Możesz kliknąć **Wyjdź**, żeby się wypisać.",
-                    ephemeral=True,
-                )
+            already = await cur.fetchone()
+            if already:
+                return await interaction.response.send_message("✅ Już dołączyłeś do tego konkursu!", ephemeral=True)
             await db.execute(
                 "INSERT INTO giveaway_entries (giveaway_id, user_id) VALUES (?, ?)",
                 (gid, interaction.user.id),
             )
             await db.commit()
 
-        count = await _gw_refresh_embed(interaction, row)
+        count = await _giveaway_entry_count(gid)
+        end_dt = datetime.fromisoformat(end_at)
+        host = interaction.guild.get_member(host_id) if interaction.guild else interaction.user
+        embed = await _build_giveaway_embed(
+            prize=prize,
+            end_at=end_dt,
+            winners_count=winners_count,
+            participants=count,
+            host=host or interaction.user,
+        )
+        try:
+            await interaction.message.edit(embed=embed, view=GiveawayView())
+        except Exception:
+            pass
         await interaction.response.send_message(
-            f"✅ Dołączyłeś! Uczestników: **{count}**\n"
-            f"Żeby wyjść — kliknij przycisk **Wyjdź**.",
-            ephemeral=True,
-        )
-
-
-class GiveawayLeaveButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(
-            label="Wyjdź",
-            style=discord.ButtonStyle.secondary,
-            emoji="🚪",
-            custom_id="giveaway_leave",
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        row = await _gw_get(interaction.message.id)
-        if not row:
-            return await interaction.response.send_message("❌ Ten konkurs już nie istnieje.", ephemeral=True)
-        gid, ended, *_ = row
-        if ended:
-            return await interaction.response.send_message("❌ Konkurs już zakończony.", ephemeral=True)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
-                (gid, interaction.user.id),
-            )
-            if not await cur.fetchone():
-                return await interaction.response.send_message(
-                    "❌ Nie jesteś zapisany w tym konkursie.", ephemeral=True
-                )
-            await db.execute(
-                "DELETE FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
-                (gid, interaction.user.id),
-            )
-            await db.commit()
-
-        count = await _gw_refresh_embed(interaction, row)
-        await interaction.response.send_message(
-            f"🚪 Wypisałeś się z konkursu. Uczestników: **{count}**",
-            ephemeral=True,
-        )
-
-
-class GiveawayListButton(discord.ui.Button):
-    """Lista uczestników — tylko mod/owner (odpowiedź ephemeral)."""
-
-    def __init__(self):
-        super().__init__(
-            label="Uczestnicy",
-            style=discord.ButtonStyle.success,
-            emoji="📋",
-            custom_id="giveaway_list",
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        u = interaction.user
-        is_staff = (
-            (interaction.guild and u.id == interaction.guild.owner_id)
-            or u.guild_permissions.administrator
-            or u.guild_permissions.manage_guild
-            or (MOD_ROLE_ID and any(r.id == MOD_ROLE_ID for r in getattr(u, "roles", [])))
-        )
-        if not is_staff:
-            return await interaction.response.send_message(
-                "❌ Nie masz permisji.",
-                ephemeral=True,
-            )
-
-        row = await _gw_get(interaction.message.id)
-        if not row:
-            return await interaction.response.send_message("❌ Nie znaleziono konkursu.", ephemeral=True)
-        gid = row[0]
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ? ORDER BY rowid",
-                (gid,),
-            )
-            ids = [r[0] for r in await cur.fetchall()]
-
-        if not ids:
-            return await interaction.response.send_message("Brak uczestników.", ephemeral=True)
-
-        lines = [f"{i}. <@{uid}> (`{uid}`)" for i, uid in enumerate(ids[:50], 1)]
-        more = f"\n… i **{len(ids) - 50}** więcej" if len(ids) > 50 else ""
-        await interaction.response.send_message(
-            f"📋 **Uczestnicy ({len(ids)}):**\n" + "\n".join(lines) + more,
-            ephemeral=True,
+            f"✅ Dołączyłeś do konkursu! Uczestników: **{count}**", ephemeral=True
         )
 
 
@@ -3059,8 +3008,6 @@ class GiveawayView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(GiveawayJoinButton())
-        self.add_item(GiveawayLeaveButton())
-        self.add_item(GiveawayListButton())
 
 
 @bot.tree.command(name="giveaway", description="Utwórz konkurs (giveaway)")
@@ -3099,7 +3046,7 @@ async def cmd_giveaway(
     )
     msg = await channel.send(embed=embed, view=GiveawayView())
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "INSERT INTO giveaways (channel_id, message_id, prize, winners_count, end_at, host_id, ended) VALUES (?,?,?,?,?,?,0)",
             (
@@ -3130,7 +3077,7 @@ async def cmd_giveaway_end(interaction: discord.Interaction, message_id: str):
         mid = int(message_id.strip())
     except ValueError:
         return await interaction.response.send_message("❌ Podaj liczbowe ID wiadomości.", ephemeral=True)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
             "SELECT id, ended FROM giveaways WHERE message_id = ?", (mid,)
         )
@@ -3143,7 +3090,7 @@ async def cmd_giveaway_end(interaction: discord.Interaction, message_id: str):
     await _end_giveaway(row[0])
 
 
-@bot.tree.command(name="giveaway_reroll", description="Wylosuj ponownie zwycięzcę (ogłoszenie na kanale konkursu)")
+@bot.tree.command(name="giveaway_reroll", description="Wylosuj ponownie zwycięzcę konkursu")
 @app_commands.describe(message_id="ID wiadomości konkursu", ilosc="Ilu nowych zwycięzców")
 @is_mod()
 async def cmd_giveaway_reroll(
@@ -3155,182 +3102,41 @@ async def cmd_giveaway_reroll(
         mid = int(message_id.strip())
     except ValueError:
         return await interaction.response.send_message("❌ Podaj liczbowe ID wiadomości.", ephemeral=True)
-
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect("moderation.db") as db:
         cur = await db.execute(
-            "SELECT id, prize, ended, channel_id FROM giveaways WHERE message_id = ?",
-            (mid,),
+            "SELECT id, prize, ended FROM giveaways WHERE message_id = ?", (mid,)
         )
         row = await cur.fetchone()
         if not row:
             return await interaction.response.send_message("❌ Nie znaleziono konkursu.", ephemeral=True)
-        gid, prize, ended, channel_id = row
+        gid, prize, ended = row
         if not ended:
-            return await interaction.response.send_message(
-                "❌ Najpierw zakończ konkurs (`/giveaway_end`).", ephemeral=True
-            )
+            return await interaction.response.send_message("❌ Najpierw zakończ konkurs.", ephemeral=True)
         cur = await db.execute(
             "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
         )
         entries = [r[0] for r in await cur.fetchall()]
-        cur = await db.execute(
-            "SELECT user_id FROM giveaway_winners WHERE giveaway_id = ?", (gid,)
-        )
-        prev_winners = {r[0] for r in await cur.fetchall()}
-        cur = await db.execute("SELECT user_id FROM giveaway_bans")
-        banned = {r[0] for r in await cur.fetchall()}
-
-    # Pula: uczestnicy bez poprzednich zwycięzców i bez banów
-    pool = [u for u in entries if u not in prev_winners and u not in banned]
-    used_fallback = False
-    if not pool:
-        pool = [u for u in entries if u not in banned]
-        used_fallback = True
-    if not pool:
-        return await interaction.response.send_message(
-            "❌ Brak osób do wylosowania.", ephemeral=True
-        )
-
-    k = min(ilosc, len(pool))
-    winners = _gw_rng().sample(pool, k)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        for uid in winners:
-            await db.execute(
-                "INSERT OR IGNORE INTO giveaway_winners (giveaway_id, user_id) VALUES (?, ?)",
-                (gid, uid),
-            )
-        await db.commit()
+    if not entries:
+        return await interaction.response.send_message("❌ Brak uczestników.", ephemeral=True)
+    winners = random.sample(entries, min(ilosc, len(entries)))
+    mentions = ", ".join(f"<@{u}>" for u in winners)
 
     role = None
-    if GIVEAWAY_WIN_ROLE_ID and interaction.guild:
+    if GIVEAWAY_WIN_ROLE_ID:
         role = interaction.guild.get_role(GIVEAWAY_WIN_ROLE_ID)
     for uid in winners:
-        m = interaction.guild.get_member(uid) if interaction.guild else None
+        m = interaction.guild.get_member(uid)
         if m and role:
             try:
                 await m.add_roles(role, reason="Giveaway reroll")
             except Exception:
                 pass
 
-    mentions = ", ".join(f"<@{u}>" for u in winners)
-    extra = f"\nRola {role.mention} nadana." if role else ""
-    note = "\n_(brak nowych osób — wylosowano z puli z poprzednimi zwycięzcami)_" if used_fallback else ""
-    announce = f"🎲 **Reroll!**\nNagroda: **{prize}**\nNowi zwycięzcy: {mentions}{extra}{note}"
-
-    # Ogłoszenie na kanale KONKURSU, nie na kanale komend
-    ch = interaction.guild.get_channel(channel_id) if interaction.guild else None
-    if not ch:
-        try:
-            ch = await bot.fetch_channel(channel_id)
-        except Exception:
-            ch = None
-
-    posted = False
-    if ch:
-        try:
-            await ch.send(announce)
-            posted = True
-        except Exception as e:
-            print(f"reroll announce: {e}")
-
     await interaction.response.send_message(
-        (f"✅ Reroll wysłany na {ch.mention}\n{mentions}" if posted else f"✅ Reroll (kanał konkursu niedostępny):\n{mentions}"),
-        ephemeral=True,
+        f"🎲 **Reroll!** Nagroda: **{prize}**\nNowi zwycięzcy: {mentions}"
     )
 
 
-@bot.tree.command(name="giveaway_list", description="Aktywne konkursy zapisane w bazie")
-@is_mod()
-async def cmd_giveaway_list(interaction: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """SELECT id, channel_id, message_id, prize, winners_count, end_at, host_id, ended
-               FROM giveaways ORDER BY id DESC LIMIT 15"""
-        )
-        rows = await cur.fetchall()
-        counts = {}
-        for r in rows:
-            c = await db.execute(
-                "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (r[0],)
-            )
-            counts[r[0]] = (await c.fetchone())[0]
-
-    if not rows:
-        return await interaction.response.send_message(
-            "Brak konkursów w bazie.", ephemeral=True
-        )
-
-    lines = []
-    for gid, ch_id, msg_id, prize, wcount, end_at, host_id, ended in rows:
-        try:
-            end_dt = datetime.fromisoformat(end_at)
-            if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
-            end_txt = f"<t:{int(end_dt.timestamp())}:f>"
-        except Exception:
-            end_txt = end_at
-        status = "🔚 zakończony" if ended else "🟢 aktywny"
-        lines.append(
-            f"**#{gid}** {status} · <#{ch_id}>\n"
-            f"Nagroda: **{prize}** · osób: **{counts.get(gid, 0)}** · wygranych: {wcount}\n"
-            f"Koniec: {end_txt} · host: <@{host_id}>\n"
-            f"ID wiadomości: `{msg_id}`"
-        )
-
-    embed = discord.Embed(
-        title="Konkursy w bazie",
-        description="\n\n".join(lines)[:4000],
-        color=0x9B59B6,
-    )
-    embed.set_footer(text=f"DB: {DB_PATH}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class SyncCommandsView(discord.ui.View):
-    """Przyciski: Wszystkie / Mniej / Zamknij — lista komend po /sync."""
-
-    def __init__(self, names: list, user_id: int):
-        super().__init__(timeout=120)
-        self.names = names
-        self.user_id = user_id
-        self.expanded = False
-
-    def _text(self) -> str:
-        n = len(self.names)
-        if self.expanded:
-            lista = ", ".join(f"`/{x}`" for x in self.names)
-            if len(lista) > 1800:
-                lista = ", ".join(f"`/{x}`" for x in self.names[:55]) + f"\n... +{n - 55}"
-        else:
-            lista = ", ".join(f"`/{x}`" for x in self.names[:20])
-            if n > 20:
-                lista += f"\n... +{n - 20}"
-        return (
-            f"✅ **Komendy odświeżone** — **{n}** (bez duplikatów).\n\n"
-            f"{lista}\n\nOdśwież listę w Discordzie: **Ctrl+R**"
-        )
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ To nie Twoja lista.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Wszystkie", style=discord.ButtonStyle.primary, emoji="📋")
-    async def btn_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.expanded = True
-        await interaction.response.edit_message(content=self._text(), view=self)
-
-    @discord.ui.button(label="Mniej", style=discord.ButtonStyle.secondary, emoji="📎")
-    async def btn_less(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.expanded = False
-        await interaction.response.edit_message(content=self._text(), view=self)
-
-    @discord.ui.button(label="Zamknij", style=discord.ButtonStyle.danger, emoji="🗑️")
-    async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="✅ Zamknięte.", view=None)
-        self.stop()
 
 
 @bot.tree.command(name="sync", description="Odśwież komendy bota (usuwa duplikaty)")
@@ -3345,9 +3151,11 @@ async def cmd_sync(interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.followup.send("❌ Użyj /sync na serwerze.", ephemeral=True)
 
+        # 1) Komendy na ten serwer (szybko)
         bot.tree.copy_global_to(guild=interaction.guild)
         synced = await bot.tree.sync(guild=interaction.guild)
 
+        # 2) Usuń GLOBALNE — bez tego Discord pokazuje każdą komendę 2x
         try:
             if bot.application_id:
                 await bot.http.bulk_upsert_global_commands(bot.application_id, [])
@@ -3355,8 +3163,13 @@ async def cmd_sync(interaction: discord.Interaction):
             print(f"clear global: {ge}")
 
         names = sorted(c.name for c in synced)
-        view = SyncCommandsView(names, interaction.user.id)
-        await interaction.followup.send(content=view._text(), view=view, ephemeral=True)
+        lista = ", ".join(f"`/{n}`" for n in names[:35])
+        more = f"\n... +{len(names) - 35}" if len(names) > 35 else ""
+        await interaction.followup.send(
+            f"✅ **Gotowe w kilka sekund** — **{len(synced)}** komend (bez duplikatów).\n\n"
+            f"{lista}{more}\n\nOdśwież Discord: **Ctrl+R**",
+            ephemeral=True,
+        )
         print(f"✅ /sync OK: {len(synced)} komend")
     except Exception as e:
         print(f"❌ /sync error: {e}")
@@ -3364,252 +3177,6 @@ async def cmd_sync(interaction: discord.Interaction):
             await interaction.followup.send(f"❌ Błąd: `{e}`", ephemeral=True)
         except Exception:
             pass
-
-
-
-@bot.tree.command(name="membercount_setup", description="Utwórz kanał z liczbą graczy (widać, nie da się wejść)")
-@is_mod()
-async def cmd_membercount_setup(interaction: discord.Interaction):
-    """Tworzy voice channel '👥 Gracze: X' — View tak, Connect nie."""
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=False,
-            speak=False,
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            manage_channels=True,
-        ),
-    }
-    count = count_real_members(guild)
-    try:
-        ch = await guild.create_voice_channel(
-            name=f"👥 Gracze: {count}",
-            overwrites=overwrites,
-            reason="Kanał licznika graczy",
-        )
-    except Exception as e:
-        return await interaction.followup.send(f"❌ Nie udało się utworzyć kanału: `{e}`", ephemeral=True)
-
-    await interaction.followup.send(
-        f"✅ Utworzono {ch.mention}\n"
-        f"**Liczba graczy:** {count} (bez botów i 3 wykluczonych ID)\n\n"
-        f"W Railway ustaw:\n```\nMEMBER_COUNT_CHANNEL_ID={ch.id}\n```\n"
-        f"i zrestartuj bota.",
-        ephemeral=True,
-    )
-
-
-
-@bot.tree.command(
-    name="chat_restrict",
-    description="Kanał: slowmode 10s + bez GIF-ów / obrazków (dla @everyone)",
-)
-@app_commands.describe(
-    kanal="Kanał tekstowy (domyślnie ten)",
-    sekundy="Slowmode w sekundach (domyślnie 10)",
-)
-@is_mod()
-async def cmd_chat_restrict(
-    interaction: discord.Interaction,
-    kanal: Optional[discord.TextChannel] = None,
-    sekundy: app_commands.Range[int, 0, 21600] = 10,
-):
-    channel = kanal or interaction.channel
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return await interaction.response.send_message("❌ To musi być kanał tekstowy.", ephemeral=True)
-
-    target = channel.parent if isinstance(channel, discord.Thread) else channel
-    if not isinstance(target, discord.TextChannel):
-        return await interaction.response.send_message("❌ Wybierz zwykły kanał tekstowy.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    # Slowmode
-    try:
-        await target.edit(slowmode_delay=sekundy, reason=f"chat_restrict przez {interaction.user}")
-    except Exception as e:
-        return await interaction.followup.send(f"❌ Nie mogę ustawić slowmode: `{e}`", ephemeral=True)
-
-    # Blokada GIF-ów / plików / embedów dla @everyone
-    # (Discord nie ma osobnego "no GIF" — to najskuteczniejsze)
-    overwrite = target.overwrites_for(interaction.guild.default_role)
-    overwrite.attach_files = False
-    overwrite.embed_links = False
-    try:
-        await target.set_permissions(
-            interaction.guild.default_role,
-            overwrite=overwrite,
-            reason=f"chat_restrict: bez GIF/obrazków przez {interaction.user}",
-        )
-    except Exception as e:
-        return await interaction.followup.send(
-            f"⚠ Slowmode **{sekundy}s** OK, ale nie mogę zmienić permisji: `{e}`\n"
-            f"Daj botowi **Manage Channels** / **Manage Roles**.",
-            ephemeral=True,
-        )
-
-    await interaction.followup.send(
-        f"✅ **{target.mention}** ustawiony:\n"
-        f"• Slowmode: **{sekundy}s** (1 wiadomość co {sekundy}s)\n"
-        f"• GIF-y / obrazki / pliki: **zablokowane** dla @everyone\n"
-        f"• Embed linki: **zablokowane**\n\n"
-        f"Modowie z wyższymi uprawnieniami nadal mogą wrzucać media.\n"
-        f"Cofnij: `/chat_unrestrict`",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(
-    name="chat_unrestrict",
-    description="Cofnij ograniczenia chatu (slowmode 0 + GIF-y z powrotem)",
-)
-@app_commands.describe(kanal="Kanał tekstowy (domyślnie ten)")
-@is_mod()
-async def cmd_chat_unrestrict(
-    interaction: discord.Interaction,
-    kanal: Optional[discord.TextChannel] = None,
-):
-    channel = kanal or interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        return await interaction.response.send_message("❌ To musi być kanał tekstowy.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        await channel.edit(slowmode_delay=0, reason=f"chat_unrestrict przez {interaction.user}")
-    except Exception as e:
-        return await interaction.followup.send(f"❌ Slowmode: `{e}`", ephemeral=True)
-
-    overwrite = channel.overwrites_for(interaction.guild.default_role)
-    overwrite.attach_files = None  # reset do domyślnych
-    overwrite.embed_links = None
-    try:
-        await channel.set_permissions(
-            interaction.guild.default_role,
-            overwrite=overwrite,
-            reason=f"chat_unrestrict przez {interaction.user}",
-        )
-    except Exception as e:
-        return await interaction.followup.send(f"⚠ Slowmode wyłączony, permisje: `{e}`", ephemeral=True)
-
-    await interaction.followup.send(
-        f"✅ **{channel.mention}** — slowmode OFF, GIF-y/pliki z powrotem dla @everyone.",
-        ephemeral=True,
-    )
-
-
-
-# ===================== GIVEAWAY BAN =====================
-@bot.tree.command(name="giveaway_ban", description="Zablokuj udział w konkursach")
-@app_commands.describe(uzytkownik="Kogo zablokować", powod="Powód")
-@is_mod()
-async def cmd_giveaway_ban(
-    interaction: discord.Interaction,
-    uzytkownik: discord.Member,
-    powod: str = "Blokada konkursów",
-):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT OR REPLACE INTO giveaway_bans (user_id, reason, banned_by, timestamp)
-               VALUES (?, ?, ?, ?)""",
-            (
-                uzytkownik.id,
-                powod,
-                interaction.user.id,
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        # wypisz ze wszystkich aktywnych
-        await db.execute(
-            """DELETE FROM giveaway_entries WHERE user_id = ? AND giveaway_id IN (
-                SELECT id FROM giveaways WHERE ended = 0
-            )""",
-            (uzytkownik.id,),
-        )
-        await db.commit()
-
-    await interaction.response.send_message(
-        f"🚫 **{uzytkownik.mention}** nie może brać udziału w konkursach.\nPowód: {powod}",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="giveaway_unban", description="Odblokuj udział w konkursach")
-@app_commands.describe(uzytkownik="Kogo odblokować")
-@is_mod()
-async def cmd_giveaway_unban(interaction: discord.Interaction, uzytkownik: discord.Member):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM giveaway_bans WHERE user_id = ?", (uzytkownik.id,))
-        await db.commit()
-    await interaction.response.send_message(
-        f"✅ **{uzytkownik.mention}** znowu może brać udział w konkursach.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="giveaway_kick", description="Wyrzuć z konkretnego konkursu (nie ban)")
-@app_commands.describe(
-    uzytkownik="Kogo wyrzucić",
-    message_id="ID wiadomości konkursu",
-)
-@is_mod()
-async def cmd_giveaway_kick(
-    interaction: discord.Interaction,
-    uzytkownik: discord.Member,
-    message_id: str,
-):
-    try:
-        mid = int(message_id.strip())
-    except ValueError:
-        return await interaction.response.send_message("❌ Złe ID wiadomości.", ephemeral=True)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, ended, channel_id, prize, winners_count, end_at, host_id FROM giveaways WHERE message_id = ?",
-            (mid,),
-        )
-        row = await cur.fetchone()
-        if not row:
-            return await interaction.response.send_message("❌ Nie znaleziono konkursu.", ephemeral=True)
-        gid, ended, ch_id, prize, winners_count, end_at, host_id = row
-        if ended:
-            return await interaction.response.send_message("❌ Konkurs już zakończony.", ephemeral=True)
-        await db.execute(
-            "DELETE FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
-            (gid, uzytkownik.id),
-        )
-        await db.commit()
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (gid,)
-        )
-        count = (await cur.fetchone())[0]
-
-    # Odśwież embed na wiadomości konkursu
-    try:
-        ch = interaction.guild.get_channel(ch_id) or await interaction.guild.fetch_channel(ch_id)
-        msg = await ch.fetch_message(mid)
-        end_dt = datetime.fromisoformat(end_at)
-        host = interaction.guild.get_member(host_id) or interaction.user
-        embed = await _build_giveaway_embed(
-            prize=prize,
-            end_at=end_dt,
-            winners_count=winners_count,
-            participants=count,
-            host=host,
-        )
-        await msg.edit(embed=embed, view=GiveawayView())
-    except Exception as e:
-        print(f"giveaway_kick embed refresh: {e}")
-
-    await interaction.response.send_message(
-        f"✅ **{uzytkownik.mention}** usunięty z konkursu. Zostało osób: **{count}**",
-        ephemeral=True,
-    )
 
 
 # ===================== START =====================
